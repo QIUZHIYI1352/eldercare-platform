@@ -1,0 +1,11 @@
+# 智慧养老 · 辅助监管与培训系统 依赖
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+python-multipart>=0.0.9
+
+# 视觉识别核心
+# 注意：mediapipe>=1.0 使用 Tasks API（需自动下载 .task 模型，见 backend/vision/pose_engine.py）
+numpy>=1.26,<2.0
+opencv-contrib-python>=4.10,<5.0
+mediapipe>=1.0

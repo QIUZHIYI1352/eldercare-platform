@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 运行时数据（数据库、下载的模型，首次启动自动生成/下载）
+data/
+models/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.task
+
+# 日志
+*.log
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 部署产物
+.docker/
+dist/
+build/

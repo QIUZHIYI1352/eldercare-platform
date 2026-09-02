@@ -1,0 +1,19 @@
+# 构建上下文排除项
+__pycache__/
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+*.task
+.git/
+.gitignore
+data/
+models/
+.venv/
+venv/
+node_modules/
+.docker/
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md

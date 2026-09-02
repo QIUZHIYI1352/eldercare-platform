@@ -1,0 +1,52 @@
+# 智慧养老 · 辅助监管与培训系统 — 一键部署
+#
+# 启动 Web 管理后台：
+#   docker compose up -d
+#   → 访问 http://localhost:8000
+#
+# 同时启动实时监控识别（RTSP 无头模式，可选）：
+#   docker compose --profile monitor up -d
+#   （先修改下方 monitor 服务的 MONITOR_SOURCE / MONITOR_PROCESS 环境变量）
+
+services:
+  web:
+    build: .
+    image: eldercare-platform:latest
+    container_name: eldercare-web
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data        # 数据库持久化
+      - ./models:/app/models    # pose 模型（首次启动自动下载）
+    environment:
+      TZ: Asia/Shanghai
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # 实时监控识别（默认不启动，按需用 --profile monitor 启动）
+  monitor:
+    build: .
+    image: eldercare-platform:latest
+    container_name: eldercare-monitor
+    profiles: ["monitor"]
+    depends_on:
+      web:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data        # 与 web 共享数据库
+      - ./models:/app/models
+    environment:
+      TZ: Asia/Shanghai
+      # 视频源：0=本机摄像头；RTSP 示例：rtsp://user:pwd@ip:554/stream1
+      MONITOR_SOURCE: "0"
+      # 护理流程名（留空则需容器交互选择，生产环境请填写）
+      MONITOR_PROCESS: ""
+      # 是否自动保存监控记录到数据库
+      MONITOR_SAVE: "true"
+    restart: unless-stopped
+    command: ["/bin/sh", "/app/scripts/monitor-entrypoint.sh"]

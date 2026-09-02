@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智慧养老 · 辅助监管与培训系统</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- 登录页 -->
+  <div id="login-view" class="login-wrap">
+    <div class="login-card">
+      <div class="login-logo">🩺</div>
+      <h1>智慧养老 · 辅助监管与培训系统</h1>
+      <p class="sub">面向护理大学生 / 长期护理员 / 养老护理员 / 养老服务师</p>
+      <div class="form-row">
+        <label>账号</label>
+        <input id="login-username" type="text" placeholder="请输入账号" value="admin">
+      </div>
+      <div class="form-row">
+        <label>密码</label>
+        <input id="login-password" type="password" placeholder="请输入密码" value="admin123">
+      </div>
+      <button class="btn btn-primary btn-block" onclick="App.login()">登 录</button>
+      <button class="btn btn-block" style="margin-top:8px;color:var(--primary);background:#eff6ff" onclick="App.showRegister()">没有账号？立即注册</button>
+      <p id="login-msg" class="msg"></p>
+      <div class="login-tips">
+        <span>默认管理员：admin / admin123</span>
+        <span>演示账号：nurse001 / caregiver001 / elderly001 / teacher001（密码 123456）</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 主应用 -->
+  <div id="app-view" class="app hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-icon">🩺</span>
+        <div class="brand-text">
+          <b>智慧养老</b>
+          <small>辅助监管与培训系统</small>
+        </div>
+      </div>
+      <nav id="nav"></nav>
+      <div class="sidebar-foot">
+        <div id="user-badge" class="user-badge"></div>
+        <button class="btn btn-ghost btn-block" onclick="App.logout()">退出登录</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <h2 id="page-title">仪表盘</h2>
+        <div class="topbar-right">
+          <span id="topbar-status" class="status-dot offline">视觉引擎未连接</span>
+        </div>
+      </header>
+      <div id="content" class="content"></div>
+    </main>
+  </div>
+
+  <!-- 通用弹窗 -->
+  <div id="modal-mask" class="modal-mask hidden">
+    <div class="modal" id="modal-body"></div>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>
