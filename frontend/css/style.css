@@ -73,6 +73,8 @@ body {
 .nav-item:hover { background: rgba(255,255,255,.06); }
 .nav-item.active { background: var(--sidebar-active); color: #fff; }
 .nav-item .ico { width: 20px; text-align: center; }
+.nav-group-title { padding: 12px 14px 4px; font-size: 11px; letter-spacing: 1px;
+  color: rgba(199, 208, 230, .55); }
 .sidebar-foot { padding: 14px; border-top: 1px solid rgba(255,255,255,.08); }
 .user-badge { padding: 10px; border-radius: 8px; background: rgba(255,255,255,.06); margin-bottom: 10px; }
 .user-badge .uname { color: #fff; font-weight: 600; }
@@ -105,6 +107,14 @@ body {
 
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+th, td { padding: 12px 14px; }
+
+/* 大屏模式 */
+.tv-mode .sidebar, .tv-mode .topbar { display: none; }
+.tv-mode .main { margin-left: 0; }
+.tv-row { font-size: 20px; padding: 16px 12px; border-bottom: 1px solid var(--border); }
+.tv-alert { color: #b91c1c; }
+.tv-cell { font-size: 18px; padding: 14px; }
 th { color: var(--muted); font-weight: 600; background: #fafbfd; }
 tr:hover td { background: #f9fafb; }
 .tag { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; }

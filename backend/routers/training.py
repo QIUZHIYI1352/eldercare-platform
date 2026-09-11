@@ -10,12 +10,17 @@ router = APIRouter(prefix="/api/training", tags=["training"])
 
 @router.get("/records")
 def list_records(user=Depends(current_user)):
+    if user["role"] in ("admin", "elderly_service_teacher"):
+        where = ""
+    else:
+        where = "WHERE t.user_id = ?"
     rows = db.query(
         """SELECT t.*, p.name AS process_name, u.name AS user_name
            FROM training_records t
            LEFT JOIN processes p ON t.process_id = p.id
            LEFT JOIN users u ON t.user_id = u.id
-           ORDER BY t.created_at DESC LIMIT 200"""
+           {where} ORDER BY t.created_at DESC LIMIT 200""".format(where=where),
+        (user["id"],) if where else (),
     )
     for r in rows:
         r["completed_steps"] = db.json_load(r.get("completed_steps"))

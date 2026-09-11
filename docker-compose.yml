@@ -1,34 +1,57 @@
-# 智慧养老 · 辅助监管与培训系统 — 一键部署
+# 智慧实训规范平台 — Linux 一键部署（MySQL 版）
 #
-# 启动 Web 管理后台：
-#   docker compose up -d
-#   → 访问 http://localhost:8000
+# 首次使用：在项目目录创建 .env 文件（复制下方两行）：
+#   MYSQL_ROOT_PASSWORD=改成你自己的强密码
 #
-# 同时启动实时监控识别（RTSP 无头模式，可选）：
-#   docker compose --profile monitor up -d
-#   （先修改下方 monitor 服务的 MONITOR_SOURCE / MONITOR_PROCESS 环境变量）
+# 启动：
+#   docker compose up -d --build
+#   → 访问 http://服务器IP:8000
 
 services:
+  mysql:
+    image: mysql:8.0
+    container_name: eldercare-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-eldercare_root}
+      TZ: Asia/Shanghai
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   web:
     build: .
     image: eldercare-platform:latest
     container_name: eldercare-web
+    depends_on:
+      mysql:
+        condition: service_healthy
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data        # 数据库持久化
       - ./models:/app/models    # pose 模型（首次启动自动下载）
     environment:
       TZ: Asia/Shanghai
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:-eldercare_root}
+      MYSQL_DB: eldercare
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 30s
 
-  # 实时监控识别（默认不启动，按需用 --profile monitor 启动）
+  # 实时监控识别（默认不启动：docker compose --profile monitor up -d）
+  # 服务器无本地摄像头，生产环境请把 MONITOR_SOURCE 指向 RTSP 网络摄像头
   monitor:
     build: .
     image: eldercare-platform:latest
@@ -38,15 +61,19 @@ services:
       web:
         condition: service_healthy
     volumes:
-      - ./data:/app/data        # 与 web 共享数据库
       - ./models:/app/models
     environment:
       TZ: Asia/Shanghai
-      # 视频源：0=本机摄像头；RTSP 示例：rtsp://user:pwd@ip:554/stream1
-      MONITOR_SOURCE: "0"
-      # 护理流程名（留空则需容器交互选择，生产环境请填写）
-      MONITOR_PROCESS: ""
-      # 是否自动保存监控记录到数据库
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:-eldercare_root}
+      MYSQL_DB: eldercare
+      MONITOR_SOURCE: "rtsp://user:password@摄像头IP:554/stream1"
+      MONITOR_PROCESS: "协助卧床老人翻身"
       MONITOR_SAVE: "true"
     restart: unless-stopped
     command: ["/bin/sh", "/app/scripts/monitor-entrypoint.sh"]
+
+volumes:
+  mysql_data:

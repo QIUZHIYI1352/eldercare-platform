@@ -8,6 +8,8 @@ import threading
 import time
 import uuid
 
+from backend import database as db
+
 try:
     import cv2
 except Exception:  # pragma: no cover
@@ -34,14 +36,27 @@ def _build_matchers(actions):
 
 
 class MonitorSession:
-    def __init__(self, source, process, actions):
+    def __init__(self, source, process, actions, user_id="", task_id="", assess=False):
         self.source = source
         self.process = process
         self.actions = actions
+        self.user_id = user_id
+        self.task_id = task_id
+        self.assess = assess
+        self.record_id = None
+        self.record = None
+        self._finish_at = 0.0
+        self._rule_state = {
+            a["id"]: {"begin": None, "first_active": None, "active": False}
+            for a in actions if a.get("template_type") != "sequence"
+        }
         self.action_map = {a["id"]: a for a in actions}
         self.rule_actions, self.seq_matchers = _build_matchers(actions)
         self.step_actions = [s.get("action_id") for s in process.get("steps", [])]
         self.steps = process.get("steps", [])
+        if assess:
+            self._frames = {"ts": [], "feats": []}
+            self._events = []
 
         self._running = False
         self._thread = None
@@ -50,6 +65,10 @@ class MonitorSession:
         self._jpeg = None
         self._jpeg_lock = threading.Lock()
         self._jpeg_ts = 0.0
+        self._step_order = None
+        self._step_since = None
+        self._off_since = None
+        self.thresholds = {"step_warn": 30, "step_crit": 60, "off": 5}
         self._state = self._empty_state()
 
     def _empty_state(self):
@@ -58,13 +77,100 @@ class MonitorSession:
             "current_step": 0, "completed_steps": [], "missed_steps": [],
             "steps": [{"order": s["order"], "name": s["name"], "status": "pending"}
                       for s in self.steps],
-            "detected_actions": [], "active_actions": [],
+            "detected_actions": [], "active_actions": [], "record_id": None,
+            "step_stay": 0, "off_screen": 0, "alert_level": "ok",
         }
 
     def start(self):
+        self._start_wall = time.time()
+        self._load_thresholds()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def _load_thresholds(self):
+        """预警阈值来自 privacy_settings（键不存在时用默认值）。"""
+        try:
+            rows = db.query("SELECT `key`, value FROM privacy_settings")
+            conf = {r["key"]: r["value"] for r in rows}
+            self.thresholds = {
+                "step_warn": int(conf.get("alert_step_warn", 30)),
+                "step_crit": int(conf.get("alert_step_crit", 60)),
+                "off": int(conf.get("alert_off_seconds", 5)),
+            }
+        except Exception:
+            pass
+
+    def wait_finished(self, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline and self._running:
+            time.sleep(0.05)
+        return self.record_id
+
+    def _frame_idx(self):
+        return len(self._frames["ts"]) - 1
+
+    def _capture_rule_events(self, features, active):
+        """规则型动作：满足起始帧 → 离开帧 作为一个事件。"""
+        from backend.vision.action_recognizer import evaluate_conditions
+        idx = self._frame_idx()
+        active_set = set(active)
+        for aid, st in self._rule_state.items():
+            action = self.action_map[aid]
+            satisfied = evaluate_conditions(features, action.get("conditions") or [])
+            if satisfied and st["begin"] is None:
+                st["begin"] = idx
+            if not satisfied:
+                st["begin"] = None
+            if aid in active_set and not st["active"]:
+                st["active"] = True
+                st["first_active"] = idx
+            elif aid not in active_set and st["active"]:
+                start = st["begin"] if st["begin"] is not None else st["first_active"]
+                end = max(start, idx - 1)
+                self._events.append({"action_id": aid, "start_idx": start, "end_idx": end})
+                st["begin"] = None
+                st["first_active"] = None
+                st["active"] = False
+
+    def _save_record(self):
+        from backend.vision.assessment import build_assessment
+        duration = max(1, int(time.time() - self._start_wall))
+        events = sorted(self._events, key=lambda e: (e["start_idx"], e["end_idx"]))
+        actions_map = {a["id"]: a for a in self.actions}
+        snapshot, segments, score = build_assessment(
+            self.steps, actions_map, events, self._frames)
+        self.record = {"steps": snapshot, "segments": segments,
+                       "score": score, "events": events, "duration": duration}
+        rid = db.gen_id("cap")
+        db.execute(
+            "INSERT INTO motion_capture_records "
+            "(id, user_id, task_id, process_id, source, source_type, status, "
+            "started_at, ended_at, steps, segments, frames, score, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, self.user_id, self.task_id, self.process.get("id", ""),
+             str(self.source), "mediapipe", "finished",
+             int(self._start_wall), int(time.time()),
+             db.json_dump(snapshot), db.json_dump(segments),
+             db.json_dump(self._frames), score, db.now()),
+        )
+        if self.task_id:
+            matched = [s["order"] for s in segments if s["result"] == "matched"]
+            missed = [s["order"] for s in segments
+                      if s["result"] in ("missed", "order_error")]
+            trid = db.gen_id("train")
+            db.execute(
+                "INSERT INTO training_records "
+                "(id, user_id, process_id, task_id, capture_record_id, score, "
+                "completed_steps, missed_steps, duration, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (trid, self.user_id, self.process.get("id", ""), self.task_id, rid,
+                 score if score is not None else 0.0,
+                 db.json_dump(matched), db.json_dump(missed),
+                 duration, db.now()),
+            )
+        self.record_id = rid
+        self._set_state(record_id=rid)
 
     def stop(self):
         self._running = False
@@ -95,43 +201,18 @@ class MonitorSession:
         except Exception:
             pass
 
-    def _draw_status(self, frame, result, active, seq_status):
-        h, w = frame.shape[:2]
-        panel_h = min(300, h)
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, panel_h), (18, 18, 18), -1)
-        y = 26
-        cv2.putText(overlay, f"[{self.process.get('name','')}] 完成度 {result['score']}%",
-                    (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-        y += 26
-        completed = set(result["completed_steps"])
-        missed = set(result["missed_steps"])
-        current = result["current_step"]
-        for s in self.steps:
-            o = s["order"]
-            if o in completed:
-                tag, color = "✓已完成", (0, 255, 0)
-            elif o == current:
-                tag, color = "▶当前", (0, 200, 255)
-            elif o in missed:
-                tag, color = "⚠漏步", (0, 0, 255)
-            else:
-                tag, color = "待执行", (150, 150, 150)
-            cv2.putText(overlay, f"{o}. {s['name']}  {tag}", (15, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            y += 22
-        line = ""
-        if active:
-            line += "规则: " + " + ".join(self.action_map[a]["name"] for a in active)
-        for aid, dist in seq_status.items():
-            thr = (self.action_map[aid].get("template_data") or {}).get("threshold", 8.0)
-            line += f" | {self.action_map[aid]['name']} DTW={dist:.0f}{'✓' if dist <= thr else ''}"
-        if line:
-            cv2.putText(overlay, line[:70], (15, y + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-        return overlay
-
     def _run(self):
+        """外层兜底：帧处理异常必须打印并落状态，避免线程静默死亡。"""
+        try:
+            self._run_impl()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._error = str(e)
+            self._set_state(running=False, error=str(e))
+            self._running = False
+
+    def _run_impl(self):
         if cv2 is None:
             self._error = "未安装 opencv，无法启动监控"
             self._running = False
@@ -148,7 +229,6 @@ class MonitorSession:
         detected_seq = []
         last_active = set()
         active_since = {}
-        seq_status = {}
         recent_names = []
 
         while self._running:
@@ -163,14 +243,23 @@ class MonitorSession:
             active = []
             if ok_pose:
                 features = PoseEngine.compute_features(pts)
+                if self.assess:
+                    self._frames["ts"].append(round(time.time() - self._start_wall, 3))
+                    self._frames["feats"].append(features_to_vector(features).tolist())
                 active = recognizer.update(features, self.rule_actions)
                 vec = features_to_vector(features)
                 for aid, m in self.seq_matchers.items():
                     dist, hit = m.update(vec)
-                    seq_status[aid] = dist
                     if hit:
                         detected_seq.append(aid)
                         recent_names.append(self.action_map[aid]["name"])
+                        if self.assess:
+                            idx = self._frame_idx()
+                            start = max(0, idx - m.template_len + 1)
+                            self._events.append(
+                                {"action_id": aid, "start_idx": start, "end_idx": idx})
+                if self.assess:
+                    self._capture_rule_events(features, active)
 
             active_set = set(active)
             for aid in active_set - last_active:
@@ -187,7 +276,6 @@ class MonitorSession:
             missed = set(result["missed_steps"])
 
             engine.draw(frame, pts) if ok_pose else None
-            frame = self._draw_status(frame, result, active, seq_status)
             self._publish_jpeg(frame)
 
             steps_status = [{
@@ -205,6 +293,34 @@ class MonitorSession:
                 active_actions=[self.action_map[a]["name"] for a in active],
             )
 
+            # 停留时长 / 离屏时长 / 预警级别（供教师看板使用）
+            now_ts = time.time()
+            if result["current_step"] != self._step_order:
+                self._step_order = result["current_step"]
+                self._step_since = now_ts
+            stay = int(now_ts - (self._step_since or now_ts))
+            if ok_pose:
+                self._off_since = None
+            elif self._off_since is None:
+                self._off_since = now_ts
+            off = int(now_ts - self._off_since) if self._off_since else 0
+            if off >= self.thresholds["off"]:
+                level = "off"
+            elif stay >= self.thresholds["step_crit"]:
+                level = "critical"
+            elif stay >= self.thresholds["step_warn"]:
+                level = "warn"
+            else:
+                level = "ok"
+            self._set_state(step_stay=stay, off_screen=off, alert_level=level)
+
+            if self.assess and result["score"] >= 100 and not self._finish_at:
+                self._finish_at = time.time() + 1.2
+            if self._finish_at and time.time() >= self._finish_at:
+                break
+
+        if self.assess:
+            self._save_record()
         cap.release()
         engine.close()
         self._set_state(running=False)
@@ -224,9 +340,9 @@ class SessionManager:
             cls._instance = cls()
         return cls._instance
 
-    def start(self, source, process, actions):
+    def start(self, source, process, actions, user_id="", task_id="", assess=False):
         sid = "sess_" + uuid.uuid4().hex[:12]
-        sess = MonitorSession(source, process, actions)
+        sess = MonitorSession(source, process, actions, user_id, task_id, assess)
         sess.start()
         with self._lock:
             self._sessions[sid] = sess

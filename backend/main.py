@@ -8,9 +8,10 @@ from fastapi.staticfiles import StaticFiles
 import config
 from backend import database as db
 from backend.routers import (auth_router, users, processes, actions,
-                             devices, monitoring, training, privacy)
+                             devices, monitoring, training, privacy, assessment,
+                             classes, tasks, dashboard, messages)
 
-app = FastAPI(title="智慧养老 · 辅助监管与培训系统", version="1.0.0")
+app = FastAPI(title="智慧实训规范平台", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,6 +29,12 @@ app.include_router(devices.router)
 app.include_router(monitoring.router)
 app.include_router(training.router)
 app.include_router(privacy.router)
+app.include_router(assessment.router)
+app.include_router(classes.router)
+app.include_router(tasks.router)
+app.include_router(dashboard.router)
+app.include_router(dashboard.teacher_router)
+app.include_router(messages.router)
 
 
 @app.on_event("startup")

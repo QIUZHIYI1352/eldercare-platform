@@ -1,4 +1,4 @@
-# 智慧养老 · 辅助监管与培训系统 依赖
+# 智慧实训规范平台 依赖
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
@@ -9,3 +9,6 @@ python-multipart>=0.0.9
 numpy>=1.26,<2.0
 opencv-contrib-python>=4.10,<5.0
 mediapipe>=1.0
+
+# MySQL 数据层（SQLite 已切换）
+PyMySQL>=1.1

@@ -1,17 +1,21 @@
-# 智慧养老 · 辅助监管与培训系统
+# 智慧实训规范平台
 # Web 管理后台 + 监控识别（RTSP 无头模式）统一镜像
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
     TZ=Asia/Shanghai
 
 # opencv / mediapipe 运行所需系统库
 #   libgl1        -> libGL.so.1 (opencv)
 #   libglib2.0-0  -> libglib-2.0.so.0 (opencv)
 #   libgomp1      -> OpenMP 运行时 (numpy/mediapipe)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
+        /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true \
+    && apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \

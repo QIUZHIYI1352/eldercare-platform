@@ -1,4 +1,4 @@
-/* 智慧养老 · 辅助监管与培训系统 前端逻辑 */
+/* 智慧实训规范平台 前端逻辑 */
 const App = {
   state: { token: null, user: null, view: "dashboard", data: {} },
   roleNames: {
@@ -81,7 +81,10 @@ const App = {
     document.getElementById("login-view").classList.add("hidden");
     document.getElementById("app-view").classList.remove("hidden");
     this.renderNav();
-    this.go("dashboard");
+    const role = this.state.user && this.state.user.role;
+    const isTeacher = role === "admin" || role === "elderly_service_teacher";
+    const wantTv = new URLSearchParams(location.search).get("tv") === "1";
+    this.go(wantTv && isTeacher ? "tv" : isTeacher ? "live" : "mytasks");
     this.checkVision();
   },
   async checkVision() {
@@ -102,43 +105,84 @@ const App = {
 
   // ---------- 导航 ----------
   navItems() {
-    const isAdmin = this.state.user && this.state.user.role === "admin";
-    const base = [
-      { key: "dashboard", ico: "📊", label: "仪表盘" },
-      { key: "processes", ico: "📋", label: "护理流程" },
-      { key: "actions",   ico: "🎯", label: "动作模板" },
-      { key: "devices",   ico: "📹", label: "监控设备" },
-      { key: "monitoring",ico: "👁️", label: "实时监管" },
-      { key: "training",  ico: "🎓", label: "培训记录" },
-    ];
-    if (isAdmin) {
-      base.push({ key: "users", ico: "👥", label: "用户管理" });
-      base.push({ key: "privacy", ico: "🔐", label: "隐私安全" });
+    const role = this.state.user && this.state.user.role;
+    const isAdmin = role === "admin";
+    const isTeacher = isAdmin || role === "elderly_service_teacher";
+    const isStudent = role === "nursing_student" || role === "long_term_caregiver" || role === "elderly_caregiver";
+    if (isTeacher) {
+      const groups = [
+        { title: "教学", items: [
+          { key: "live", label: "教学看板" },
+          { key: "archive", label: "学员档案" },
+          { key: "messages", label: "消息" }] },
+        { title: "组织", items: [
+          { key: "classes", label: "班级管理" },
+          { key: "tasks", label: "任务发布" }] },
+        { title: "内容", items: [
+          { key: "library", label: "步骤库" },
+          { key: "devices", label: "设备管理" }] },
+        { title: "练习", items: [
+          { key: "monitoring", label: "实时监控" },
+          { key: "assessment", label: "动作对比" },
+          { key: "training", label: "培训记录" }] },
+      ];
+      if (isAdmin) {
+        groups.push({ title: "管理", items: [
+          { key: "users", label: "用户管理" },
+          { key: "privacy", label: "隐私安全" }] });
+      }
+      return groups;
     }
-    return base;
+    if (isStudent) {
+      return [{ title: "学习", items: [
+        { key: "mytasks", label: "我的任务" },
+        { key: "assessment", label: "动作对比" },
+        { key: "monitoring", label: "实时监控" },
+        { key: "training", label: "个人记录" },
+        { key: "messages", label: "消息" }] }];
+    }
+    return [];
   },
   renderNav() {
     const nav = document.getElementById("nav");
-    nav.innerHTML = this.navItems().map(i =>
-      `<div class="nav-item" data-view="${i.key}" onclick="App.go('${i.key}')">
-        <span class="ico">${i.ico}</span><span>${i.label}</span></div>`).join("");
+    nav.innerHTML = this.navItems().map(g =>
+      `<div class="nav-group-title">${g.title}</div>` +
+      g.items.map(i =>
+        `<div class="nav-item" data-view="${i.key}" onclick="App.go('${i.key}')">
+          <span>${i.label}</span></div>`).join("")).join("");
     const ub = document.getElementById("user-badge");
     ub.innerHTML = `<div class="uname">${this.state.user.name}</div>
       <div class="urole">${this.roleNames[this.state.user.role] || this.state.user.role}</div>`;
+    this.refreshUnread();
   },
   go(view) {
     this.state.view = view;
-    if (view !== "monitoring" && this.state.monSession) this.stopMonitor(true);
+    document.body.classList.toggle("tv-mode", view === "tv");
+    if (view !== "tv" && this._tvTimer) { clearInterval(this._tvTimer); this._tvTimer = null; }
+    if (view !== "live" && this._liveTimer) {
+      clearInterval(this._liveTimer);
+      this._liveTimer = null;
+    }
+    if ((view !== "monitoring" && view !== "assessment") && this.state.monSession) this.stopMonitor(true);
     document.querySelectorAll(".nav-item").forEach(el =>
       el.classList.toggle("active", el.dataset.view === view));
     const titles = { dashboard: "仪表盘", processes: "护理流程管理", actions: "动作模板管理",
-      devices: "监控设备管理", monitoring: "实时监管", training: "培训记录",
+      devices: "监控设备管理", monitoring: "实时监管", assessment: "动作对比", training: "培训记录",
+      classes: "班级管理", tasks: "任务发布", mytasks: "我的任务",
+      live: "教学看板", archive: "学员档案", library: "步骤库",
+      messages: "消息", tv: "大屏模式",
       users: "用户管理", privacy: "隐私安全" };
     document.getElementById("page-title").textContent = titles[view] || view;
     const views = {
       dashboard: () => this.renderDashboard(), processes: () => this.renderProcesses(),
       actions: () => this.renderActions(), devices: () => this.renderDevices(),
-      monitoring: () => this.renderMonitoring(), training: () => this.renderTraining(),
+      monitoring: () => this.renderMonitoring(), assessment: () => this.renderAssessment(),
+      training: () => this.renderTraining(),
+      classes: () => this.renderClasses(), tasks: () => this.renderTasks(),
+      mytasks: () => this.renderMyTasks(),
+      live: () => this.renderLive(), archive: () => this.renderArchive(),
+      library: () => this.renderLibrary(), messages: () => this.renderMessages(),
+      tv: () => this.renderTv(),
       users: () => this.renderUsers(), privacy: () => this.renderPrivacy(),
     };
     (views[view] || (() => {}))();
@@ -151,14 +195,17 @@ const App = {
     document.getElementById("modal-body").innerHTML = html;
     document.getElementById("modal-mask").classList.remove("hidden");
   },
-  closeModal() { document.getElementById("modal-mask").classList.add("hidden"); },
+  closeModal() {
+    document.getElementById("modal-mask").classList.add("hidden");
+    if (this._frameModalTimer) { clearInterval(this._frameModalTimer); this._frameModalTimer = null; }
+  },
   emptyHtml(txt) { return `<div class="empty">${txt || "暂无数据"}</div>`; },
 
   // ---------- 仪表盘 ----------
   async renderDashboard() {
     const c = document.getElementById("content");
     c.innerHTML = `<div class="banner banner-info">
-      🎯 系统核心能力：① 通过 cv2 + mediapipe 实时识别护理操作动作，比对标准流程，<b>提醒「哪一步漏掉了」</b>；
+      系统核心能力：① 通过 cv2 + mediapipe 实时识别护理操作动作，比对标准流程，<b>提醒「哪一步漏掉了」</b>；
       ② 数据本地处理、敏感信息脱敏、分级权限、审计日志，<b>优化隐私安全监管能力</b>。</div>
       <div class="grid grid-4" id="stats"></div>
       <div class="grid grid-2" style="margin-top:16px">
@@ -170,10 +217,10 @@ const App = {
       this.api("/api/devices"), this.api("/api/training/records"),
     ]);
     const stats = [
-      { n: procs.items.length, l: "护理流程", i: "📋" },
-      { n: acts.items.length, l: "识别动作", i: "🎯" },
-      { n: devs.items.length, l: "监控设备", i: "📹" },
-      { n: trains.items.length, l: "培训记录", i: "🎓" },
+      { n: procs.items.length, l: "护理流程", i: "" },
+      { n: acts.items.length, l: "识别动作", i: "" },
+      { n: devs.items.length, l: "监控设备", i: "" },
+      { n: trains.items.length, l: "培训记录", i: "" },
     ];
     document.getElementById("stats").innerHTML = stats.map(s =>
       `<div class="stat"><span class="ico">${s.i}</span><div class="num">${s.n}</div><div class="lbl">${s.l}</div></div>`).join("");
@@ -286,13 +333,13 @@ const App = {
     try {
       if (pid) await this.api("/api/processes/" + pid, "PUT", payload);
       else await this.api("/api/processes", "POST", payload);
-      this.closeModal(); this.go("processes");
+      this.closeModal(); this.state.libTab = "processes"; this.go("library");
     } catch (e) { alert(e.message); }
   },
   async delProcess(pid) {
     if (!confirm("确认删除该流程？")) return;
     await this.api("/api/processes/" + pid, "DELETE");
-    this.go("processes");
+    this.state.libTab = "processes"; this.go("library");
   },
 
   // ---------- 动作模板 ----------
@@ -301,7 +348,7 @@ const App = {
     const [data, fields] = await Promise.all([
       this.api("/api/actions"), this.api("/api/actions/fields")]);
     this.state._fields = fields.items;
-    c.innerHTML = `<div class="banner banner-info">🎯 自主添加识别动作，支持两类模板：
+    c.innerHTML = `<div class="banner banner-info">自主添加识别动作，支持两类模板：
       <b>① 规则判定</b>（关节特征 + 阈值 + 持续时间）与 <b>② 骨骼序列模板</b>（DTW 精细匹配过程性动作）。
       序列模板可用 <code>python record_template.py --name "动作名"</code> 录制。特征字段见下表。</div>
       <div class="card"><div class="card-head"><h3>可识别动作模板</h3>
@@ -435,13 +482,13 @@ const App = {
     try {
       if (aid) await this.api("/api/actions/" + aid, "PUT", payload);
       else await this.api("/api/actions", "POST", payload);
-      this.closeModal(); this.go("actions");
+      this.closeModal(); this.state.libTab = "actions"; this.go("library");
     } catch (e) { alert(e.message); }
   },
   async delAction(aid) {
     if (!confirm("确认删除该动作？关联流程步骤将失去识别目标")) return;
     await this.api("/api/actions/" + aid, "DELETE");
-    this.go("actions");
+    this.state.libTab = "actions"; this.go("library");
   },
 
   // ---------- 设备 ----------
@@ -522,7 +569,7 @@ const App = {
           <div class="form-row" style="margin:0"><label>自定义视频源（可选，覆盖设备）</label>
             <input id="mon-source" placeholder="rtsp://... 或 0"></div>
           <div style="display:flex;gap:8px">
-            <button class="btn btn-primary" id="mon-start" onclick="App.startMonitor()">▶ 开始监控</button>
+            <button class="btn btn-primary" id="mon-start" onclick="App.startMonitor()">开始监控</button>
             <button class="btn btn-danger" id="mon-stop" onclick="App.stopMonitor()" disabled>停止</button>
           </div>
         </div>
@@ -581,7 +628,7 @@ const App = {
   refreshFrame() {
     const sid = this.state.monSession;
     if (!sid) return;
-    const img = document.getElementById("mon-stream");
+    const img = document.getElementById("mon-stream") || document.getElementById("as-stream");
     if (img) img.src = "/api/monitoring/sessions/" + sid + "/frame?t=" + Date.now();
   },
   async stopMonitor(silent) {
@@ -591,6 +638,11 @@ const App = {
     }
     if (this._monTimer) { clearInterval(this._monTimer); this._monTimer = null; }
     if (this._frameTimer) { clearInterval(this._frameTimer); this._frameTimer = null; }
+    if (this._asTimer) { clearInterval(this._asTimer); this._asTimer = null; }
+    if (this._asFrameTimer) { clearInterval(this._asFrameTimer); this._asFrameTimer = null; }
+    this.state.assessMode = false;
+    this.state.taskId = null;
+    this.state.taskTitle = "";
     const img = document.getElementById("mon-stream");
     if (img) { img.style.display = "none"; img.src = ""; }
     const ph = document.getElementById("mon-placeholder");
@@ -616,6 +668,15 @@ const App = {
     }, 600);
   },
   renderMonitorState(s) {
+    if (s.error) {
+      const statusEl = document.getElementById("mon-status");
+      if (statusEl) { statusEl.className = "tag tag-red"; statusEl.textContent = "识别出错"; }
+      const ph = document.getElementById("mon-placeholder");
+      if (ph) { ph.textContent = "识别出错：" + s.error; ph.style.display = ""; }
+      const img = document.getElementById("mon-stream");
+      if (img) { img.style.display = "none"; img.src = ""; }
+      return;
+    }
     const scoreEl = document.getElementById("mon-score");
     if (scoreEl) {
       scoreEl.textContent = "完成度 " + (s.score != null ? s.score + "%" : "--");
@@ -626,8 +687,8 @@ const App = {
       stepsEl.innerHTML = s.steps.map(st => {
         const cls = st.status === "done" ? "done" : st.status === "miss" ? "miss"
           : st.status === "current" ? "current" : "";
-        const label = st.status === "done" ? "✓已完成" : st.status === "miss" ? "⚠漏步"
-          : st.status === "current" ? "▶当前" : "待执行";
+        const label = st.status === "done" ? "已完成" : st.status === "miss" ? "漏步"
+          : st.status === "current" ? "当前" : "待执行";
         return `<div class="step-item ${cls}"><span class="order">${st.order}</span>
           <span>${this.esc(st.name)}</span><span style="margin-left:auto;font-size:12px;color:var(--muted)">${label}</span></div>`;
       }).join("");
@@ -636,18 +697,217 @@ const App = {
     if (detEl) detEl.textContent = (s.detected_actions || []).join(" → ") || "-";
   },
 
+  // ---------- 动作对比 ----------
+  async renderAssessment() {
+    const c = document.getElementById("content");
+    const [procs, data] = await Promise.all([
+      this.api("/api/processes"), this.api("/api/assessment/records")]);
+    const pname = {};
+    procs.items.forEach(p => pname[p.id] = p.name);
+    const procOpts = procs.items.map(p => `<option value="${p.id}">${this.esc(p.name)}</option>`).join("");
+    const taskMode = !!this.state.taskId;
+    window._reportFrom = taskMode ? "mytasks" : "assessment";
+    const headerTitle = taskMode
+      ? `任务练习：${this.esc(this.state.taskTitle || "")}`
+      : "动作对比（摄像头采集 → 自动评分）";
+    c.innerHTML = `
+      <div class="card">
+        <div class="card-head"><h3>${headerTitle}</h3>
+          <span id="as-status" class="tag tag-gray">未开始</span></div>
+        <div class="grid" style="grid-template-columns:1fr 1fr auto;gap:12px;align-items:end">
+          <div class="form-row" style="margin:0;${taskMode ? "display:none" : ""}"><label>护理流程</label>
+            <select id="as-process">${procOpts}</select></div>
+          <div class="form-row" style="margin:0"><label>自定义视频源（留空用本机摄像头）</label>
+            <input id="as-source" placeholder="rtsp://... 或留空"></div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-primary" id="as-start" onclick="App.startAssessment()">开始</button>
+            <button class="btn btn-danger" id="as-stop" onclick="App.stopAssessment()" disabled>结束</button>
+          </div>
+        </div>
+        <div class="grid" style="grid-template-columns:1.5fr 1fr;margin-top:16px">
+          <div style="background:#0f1115;border-radius:10px;min-height:340px;display:flex;align-items:center;justify-content:center;overflow:hidden">
+            <img id="as-stream" style="max-width:100%;max-height:520px;display:none">
+            <span id="as-placeholder" style="color:#4b5563">选流程后点「开始」，完整做一遍标准流程</span>
+          </div>
+          <div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+              <b>步骤状态</b><span id="as-score" class="tag tag-gray">完成度 --</span>
+            </div>
+            <div id="as-steps" class="step-list"><div class="empty">开始后实时显示</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="card"><div class="card-head"><h3>对比记录</h3></div>
+      <table><thead><tr><th>流程</th><th>得分</th><th>遗漏</th><th>顺序错误</th><th>时间</th><th>操作</th></tr></thead>
+      <tbody>${data.items.length ? data.items.map(r => `<tr>
+        <td>${this.esc(pname[r.process_id] || "-")}</td>
+        <td>${r.score == null ? '<span class="tag tag-gray">无标准</span>' : `<span class="tag ${r.score >= 80 ? "tag-green" : r.score >= 60 ? "tag-amber" : "tag-red"}">${r.score}分</span>`}</td>
+        <td>${r.missed ? `<span class="tag tag-red">${r.missed} 步</span>` : '<span class="tag tag-green">无</span>'}</td>
+        <td>${r.order_errors ? `<span class="tag tag-amber">${r.order_errors} 步</span>` : '<span class="tag tag-green">无</span>'}</td>
+        <td>${new Date((r.started_at || 0) * 1000).toLocaleString()}</td>
+        <td><button class="btn btn-sm btn-primary" onclick="App.renderAssessmentReport('${r.id}')">查看报告</button></td>
+      </tr>`).join("") : `<tr><td colspan="6">${this.emptyHtml("暂无对比记录")}</td></tr>`}</tbody></table></div>`;
+  },
+  async startAssessment() {
+    const processId = document.getElementById("as-process").value;
+    const source = document.getElementById("as-source").value.trim() || "0";
+    const taskMode = !!this.state.taskId;
+    if (!taskMode && !processId) { alert("请选择流程"); return; }
+    try {
+      const body = taskMode ? { task_id: this.state.taskId, source }
+        : { source, process_id: processId };
+      const data = await this.api("/api/assessment/sessions", "POST", body);
+      this.state.monSession = data.session_id;
+      this.state.assessMode = true;
+      const img = document.getElementById("as-stream");
+      img.style.display = "block";
+      document.getElementById("as-placeholder").style.display = "none";
+      document.getElementById("as-start").disabled = true;
+      document.getElementById("as-stop").disabled = false;
+      document.getElementById("as-status").className = "tag tag-green";
+      document.getElementById("as-status").textContent = "采集中";
+      this.refreshFrame();
+      if (this._asFrameTimer) clearInterval(this._asFrameTimer);
+      this._asFrameTimer = setInterval(() => this.refreshFrame(), 120);
+      this.pollAssessment();
+    } catch (e) { alert(e.message); }
+  },
+  async stopAssessment(recordId) {
+    const fromTask = !!this.state.taskId;
+    window._reportFrom = fromTask ? "mytasks" : "assessment";
+    if (this.state.monSession && !recordId) {
+      try {
+        const r = await this.api("/api/assessment/sessions/" + this.state.monSession, "DELETE");
+        recordId = r.record_id;
+      } catch (e) {}
+    }
+    this.state.monSession = null;
+    this.state.assessMode = false;
+    this.state.taskId = null;
+    this.state.taskTitle = "";
+    if (this._asFrameTimer) { clearInterval(this._asFrameTimer); this._asFrameTimer = null; }
+    if (this._asTimer) { clearInterval(this._asTimer); this._asTimer = null; }
+    const img = document.getElementById("as-stream");
+    if (img) { img.style.display = "none"; img.src = ""; }
+    const ph = document.getElementById("as-placeholder");
+    if (ph) ph.style.display = "";
+    const st = document.getElementById("as-start");
+    if (st) st.disabled = false;
+    const sp = document.getElementById("as-stop");
+    if (sp) sp.disabled = true;
+    const ms = document.getElementById("as-status");
+    if (ms) { ms.className = "tag tag-gray"; ms.textContent = "未开始"; }
+    if (recordId) this.renderAssessmentReport(recordId);
+  },
+  pollAssessment() {
+    if (this._asTimer) clearInterval(this._asTimer);
+    this._asTimer = setInterval(async () => {
+      const sid = this.state.monSession;
+      if (!sid) { clearInterval(this._asTimer); this._asTimer = null; return; }
+      try {
+        const s = await this.api("/api/monitoring/sessions/" + sid + "/state");
+        this.renderAssessmentState(s);
+        if (s.running === false) {
+          this.stopAssessment();
+        }
+      } catch (e) {}
+    }, 600);
+  },
+  renderAssessmentState(s) {
+    if (s.error) {
+      const statusEl = document.getElementById("as-status");
+      if (statusEl) { statusEl.className = "tag tag-red"; statusEl.textContent = "识别出错"; }
+      const ph = document.getElementById("as-placeholder");
+      if (ph) { ph.textContent = "识别出错：" + s.error; ph.style.display = ""; }
+      const img = document.getElementById("as-stream");
+      if (img) { img.style.display = "none"; img.src = ""; }
+      return;
+    }
+    const scoreEl = document.getElementById("as-score");
+    if (scoreEl) {
+      scoreEl.textContent = "完成度 " + (s.score != null ? s.score + "%" : "--");
+      scoreEl.className = "tag " + (s.score >= 80 ? "tag-green" : s.score >= 60 ? "tag-amber" : "tag-red");
+    }
+    const stepsEl = document.getElementById("as-steps");
+    if (stepsEl && s.steps) {
+      stepsEl.innerHTML = s.steps.map(st => {
+        const cls = st.status === "done" ? "done" : st.status === "miss" ? "miss"
+          : st.status === "current" ? "current" : "";
+        const label = st.status === "done" ? "已完成" : st.status === "miss" ? "漏步"
+          : st.status === "current" ? "当前" : "待执行";
+        return `<div class="step-item ${cls}"><span class="order">${st.order}</span>
+          <span>${this.esc(st.name)}</span><span style="margin-left:auto;font-size:12px;color:var(--muted)">${label}</span></div>`;
+      }).join("");
+    }
+  },
+  async renderAssessmentReport(rid) {
+    const c = document.getElementById("content");
+    const backView = window._reportFrom === "mytasks" ? "mytasks" : "assessment";
+    const backLabel = backView === "mytasks" ? "返回我的任务" : "返回";
+    let r;
+    try { r = await this.api("/api/assessment/records/" + rid); }
+    catch (e) { alert(e.message); return; }
+    const segRows = (r.segments || []).map(s => {
+      const tagMap = { matched: '<span class="tag tag-green">完成</span>',
+        order_error: '<span class="tag tag-amber">顺序错误</span>',
+        missed: '<span class="tag tag-red">遗漏</span>' };
+      const scoreHtml = s.comparable
+        ? (s.score == null ? '<span class="tag tag-gray">--</span>' : `${s.score} 分`)
+        : '<span class="tag tag-gray">无标准</span>';
+      const startSec = s.start_ts != null ? s.start_ts.toFixed(2) : "";
+      const endSec = s.end_ts != null ? s.end_ts.toFixed(2) : "";
+      const editable = s.result === "matched" ? `
+        <input type="number" step="0.1" data-order="${s.order}" data-edge="start" value="${startSec}" style="width:76px">
+        ~ <input type="number" step="0.1" data-order="${s.order}" data-edge="end" value="${endSec}" style="width:76px"> 秒` : startSec ? `${startSec} ~ ${endSec} 秒` : "--";
+      return `<tr><td>${s.order}. ${this.esc(s.name)}</td><td>${tagMap[s.result] || s.result}</td>
+        <td>${editable}</td><td>${scoreHtml}</td></tr>`;
+    }).join("");
+    c.innerHTML = `
+      <div class="card">
+        <div class="card-head"><h3>对比报告 · ${this.esc(r.process_name || "")}</h3>
+          <button class="btn" onclick="App.go('${backView}')">${backLabel}</button></div>
+        <div class="grid grid-4" style="margin-bottom:16px">
+          <div class="stat"><div class="num">${r.score == null ? "--" : r.score}</div><div class="lbl">总分（有标准步骤平均）</div></div>
+          <div class="stat"><div class="num">${(r.segments || []).filter(s => s.result === "missed").length}</div><div class="lbl">遗漏步数</div></div>
+          <div class="stat"><div class="num">${(r.segments || []).filter(s => s.result === "order_error").length}</div><div class="lbl">顺序错误步数</div></div>
+          <div class="stat"><div class="num">${(r.segments || []).filter(s => s.comparable).length}</div><div class="lbl">可评分步数</div></div>
+        </div>
+        <div class="banner banner-info">完成步可在「边界」列直接改起止秒数后点保存重算。</div>
+        <table><thead><tr><th>步骤</th><th>结果</th><th>边界</th><th>得分</th></tr></thead>
+        <tbody>${segRows || `<tr><td colspan="4">${this.emptyHtml("无步骤")}</td></tr>`}</tbody></table>
+        <div class="modal-actions"><button class="btn btn-primary" onclick="App.saveAssessmentSegments('${rid}')">保存边界并重算</button></div>
+      </div>`;
+  },
+  async saveAssessmentSegments(rid) {
+    const rows = [...document.querySelectorAll("#content input[data-edge]")];
+    const segments = rows.reduce((acc, el) => {
+      const o = Number(el.dataset.order);
+      acc[o] = acc[o] || { order: o };
+      acc[o][el.dataset.edge === "start" ? "start_ts" : "end_ts"] = parseFloat(el.value) || 0;
+      return acc;
+    }, {});
+    try {
+      const r = await this.api("/api/assessment/records/" + rid + "/segments", "PUT",
+        { segments: Object.values(segments) });
+      alert("已重算，总分 " + (r.score == null ? "--" : r.score));
+      this.renderAssessmentReport(rid);
+    } catch (e) { alert(e.message); }
+  },
+
   // ---------- 培训记录 ----------
   async renderTraining() {
     const c = document.getElementById("content");
     const data = await this.api("/api/training/records");
-    c.innerHTML = `<div class="card"><div class="card-head"><h3>培训记录（操作过程防漏训练）</h3></div>
-      <table><thead><tr><th>学员</th><th>护理流程</th><th>得分</th><th>完成/漏步</th><th>用时(秒)</th><th>时间</th></tr></thead>
+    const isStudent = ["nursing_student", "long_term_caregiver", "elderly_caregiver"].includes(this.state.user && this.state.user.role);
+    c.innerHTML = `<div class="card"><div class="card-head"><h3>${isStudent ? "个人记录（我的练习）" : "培训记录（操作过程防漏训练）"}</h3></div>
+      <table><thead><tr><th>学员</th><th>护理流程</th><th>得分</th><th>完成/漏步</th><th>用时(秒)</th><th>时间</th><th>操作</th></tr></thead>
       <tbody>${data.items.length ? data.items.map(t => `<tr>
         <td>${this.esc(t.user_name || "-")}</td><td>${this.esc(t.process_name || "-")}</td>
         <td><span class="tag ${t.score >= 80 ? "tag-green" : t.score >= 60 ? "tag-amber" : "tag-red"}">${t.score}分</span></td>
         <td>${(t.completed_steps || []).length} 完成 / ${(t.missed_steps || []).length} 漏步</td>
         <td>${t.duration}</td><td>${new Date((t.created_at || 0) * 1000).toLocaleString()}</td>
-      </tr>`).join("") : `<tr><td colspan="6">${this.emptyHtml("暂无培训记录")}</td></tr>`}</tbody></table></div>`;
+        <td>${t.capture_record_id ? `<button class="btn btn-sm btn-primary" onclick="App.renderAssessmentReport('${t.capture_record_id}')">查看报告</button>` : ""}</td>
+      </tr>`).join("") : `<tr><td colspan="7">${this.emptyHtml(isStudent ? "暂无练习记录" : "暂无培训记录")}</td></tr>`}</tbody></table></div>`;
   },
 
   // ---------- 用户管理 ----------
@@ -741,7 +1001,542 @@ const App = {
       this.go("privacy");
     } catch (e) { alert(e.message); }
   },
+
+  // ---------- 预警看板 ----------
+  async renderLive() {
+    const c = document.getElementById("content");
+    c.innerHTML = `<div class="card"><div class="card-head"><h3>进行中练习</h3></div>
+      <div id="live-sessions">加载中…</div></div>
+      <div class="card"><div class="card-head"><h3>预警（总分<60 / 遗漏 / 顺序错误）</h3></div>
+      <div id="live-alerts">加载中…</div></div>`;
+    await this.refreshLive();
+    if (this._liveTimer) clearInterval(this._liveTimer);
+    this._liveTimer = setInterval(() => this.refreshLive(), 3000);
+  },
+  async refreshLive() {
+    try {
+      const d = await this.api("/api/dashboard/live");
+      const sEl = document.getElementById("live-sessions");
+      if (sEl) {
+        sEl.innerHTML = d.sessions.length ? d.sessions.map(s => `
+          <div class="step-item"><span class="order">${this.esc((s.user_name || "?").slice(0, 1))}</span>
+            <span>${this.esc(s.user_name)}${s.class_name ? " · " + this.esc(s.class_name) : ""}
+            ${s.task_name ? " · " + this.esc(s.task_name) : ""}</span>
+            <span style="margin-left:auto">${this.esc(s.process_name)} · 完成度 ${s.score ?? "--"}%</span></div>`).join("")
+          : this.emptyHtml("暂无进行中的练习");
+      }
+      const aEl = document.getElementById("live-alerts");
+      if (aEl) {
+        aEl.innerHTML = d.alerts.length ? d.alerts.map(a => `
+          <div class="step-item ${a.missed || a.order_errors ? "miss" : ""}">
+            <span>${this.esc(a.user_name)}${a.class_name ? " · " + this.esc(a.class_name) : ""}
+            ${a.task_name ? " · " + this.esc(a.task_name) : ""}</span>
+            <span style="margin-left:auto;font-size:12px">
+              得分 ${a.score ?? "--"}｜遗漏 ${a.missed}｜顺序错 ${a.order_errors}
+              <button class="btn btn-sm" onclick="App.renderAssessmentReport('${a.record_id}')">报告</button></span>
+          </div>`).join("")
+          : this.emptyHtml("暂无预警记录");
+      }
+    } catch (e) {}
+  },
+
+  // ---------- 学员档案 ----------
+  async renderArchive() {
+    const c = document.getElementById("content");
+    const cls = await this.api("/api/classes");
+    c.innerHTML = `<div class="card"><div class="card-head"><h3>学员档案</h3>
+      <select id="archive-class" onchange="App.loadArchive()">
+        <option value="">请选择班级</option>
+        ${cls.items.map(x => `<option value="${x.id}">${this.esc(x.name)}</option>`).join("")}
+      </select></div>
+      <div id="archive-list">${this.emptyHtml("先选择班级")}</div></div>`;
+  },
+  async loadArchive() {
+    const cid = document.getElementById("archive-class").value;
+    const box = document.getElementById("archive-list");
+    if (!cid) { box.innerHTML = this.emptyHtml("先选择班级"); return; }
+    const d = await this.api("/api/teacher/students?class_id=" + cid);
+    box.innerHTML = `<table><thead><tr><th>学员</th><th>任务数</th><th>练习次数</th><th>平均分</th><th>最近练习</th><th>操作</th></tr></thead>
+      <tbody>${d.items.map(s => `<tr>
+        <td><b>${this.esc(s.name)}</b>（${this.esc(s.username)}）</td>
+        <td>${s.tasks_done}</td><td>${s.records_count}</td>
+        <td>${s.avg_score == null ? "--" : s.avg_score}</td>
+        <td>${s.last_at ? new Date(s.last_at * 1000).toLocaleString() : "--"}</td>
+        <td><button class="btn btn-sm btn-primary" onclick="App.loadStudentRecords('${s.id}')">查看记录</button></td>
+      </tr>`).join("") || `<tr><td colspan="6">${this.emptyHtml("班级暂无学员")}</td></tr>`}</tbody></table>
+      <div id="student-records"></div>`;
+  },
+  async loadStudentRecords(uid) {
+    const box = document.getElementById("student-records");
+    const d = await this.api("/api/teacher/students/" + uid + "/records");
+    box.innerHTML = `<div style="margin-top:14px"><h4 style="margin-bottom:8px">练习明细</h4>
+      <table><thead><tr><th>任务</th><th>流程</th><th>得分</th><th>遗漏</th><th>顺序错误</th><th>时间</th><th>操作</th></tr></thead>
+      <tbody>${d.items.map(r => `<tr>
+        <td>${this.esc(r.task_name || "-")}</td><td>${this.esc(r.process_name || "-")}</td>
+        <td>${r.score == null ? "--" : r.score}</td><td>${r.missed}</td><td>${r.order_errors}</td>
+        <td>${new Date((r.started_at || 0) * 1000).toLocaleString()}</td>
+        <td><button class="btn btn-sm" onclick="App.renderAssessmentReport('${r.id}')">报告</button></td>
+      </tr>`).join("") || `<tr><td colspan="7">${this.emptyHtml("暂无练习记录")}</td></tr>`}</tbody></table></div>`;
+  },
+
+  // ---------- 班级管理 ----------
+  async renderClasses() {
+    const c = document.getElementById("content");
+    const data = await this.api("/api/classes");
+    c.innerHTML = `<div class="card"><div class="card-head"><h3>我的班级</h3>
+      <button class="btn btn-primary" onclick="App.editClass()">+ 新建班级</button></div>
+      <div id="class-list"></div></div>`;
+    const list = document.getElementById("class-list");
+    if (!data.items.length) { list.innerHTML = this.emptyHtml("暂无班级"); return; }
+    list.innerHTML = data.items.map(cls => `
+      <div class="card" style="box-shadow:none;border:1px solid var(--border)">
+        <div class="card-head"><h3>${this.esc(cls.name)}
+          <span class="tag tag-blue">${cls.member_count} 人</span></h3>
+          <div>
+            <button class="btn btn-sm" onclick="App.renderClassMembers('${cls.id}')">成员管理</button>
+            <button class="btn btn-sm btn-primary" onclick="App.editClass('${cls.id}')">编辑</button>
+            <button class="btn btn-sm btn-danger" onclick="App.delClass('${cls.id}')">删除</button>
+          </div></div>
+        <p style="color:var(--muted);font-size:13px">${this.esc(cls.description || "")}</p>
+      </div>`).join("");
+  },
+  async editClass(cid) {
+    let cls = { name: "", description: "" };
+    if (cid) {
+      const data = await this.api("/api/classes");
+      cls = data.items.find(x => x.id === cid);
+    }
+    this.openModal(`
+      <h3>${cid ? "编辑" : "新建"}班级</h3>
+      <div class="form-row"><label>班级名称</label><input id="c-name" value="${this.esc(cls.name)}"></div>
+      <div class="form-row"><label>描述（可选）</label><textarea id="c-desc">${this.esc(cls.description || "")}</textarea></div>
+      <div class="modal-actions">
+        <button class="btn" onclick="App.closeModal()">取消</button>
+        <button class="btn btn-primary" onclick="App.saveClass('${cid || ""}')">保存</button>
+      </div>`);
+  },
+  async saveClass(cid) {
+    const payload = { name: document.getElementById("c-name").value.trim(),
+      description: document.getElementById("c-desc").value.trim() };
+    if (!payload.name) { alert("请填写班级名称"); return; }
+    try {
+      if (cid) await this.api("/api/classes/" + cid, "PUT", payload);
+      else await this.api("/api/classes", "POST", payload);
+      this.closeModal(); this.go("classes");
+    } catch (e) { alert(e.message); }
+  },
+  async delClass(cid) {
+    if (!confirm("确认删除该班级？成员关系会一并删除")) return;
+    await this.api("/api/classes/" + cid, "DELETE");
+    this.go("classes");
+  },
+  async renderClassMembers(cid) {
+    const data = await this.api("/api/classes/" + cid + "/members");
+    this.openModal(`<h3>成员管理</h3>
+      <div class="form-row"><label>按账号添加学员（逗号分隔多个）</label>
+        <input id="m-names" placeholder="nurse001, elderly001"></div>
+      <button class="btn btn-primary" onclick="App.addClassMembers('${cid}')">添加</button>
+      <p id="m-msg" class="msg"></p>
+      <table style="margin-top:12px"><thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>操作</th></tr></thead>
+      <tbody>${data.items.map(m => `<tr><td>${this.esc(m.username)}</td><td>${this.esc(m.name)}</td>
+        <td>${this.esc(this.roleNames[m.role] || m.role)}</td>
+        <td><button class="btn btn-sm btn-danger" onclick="App.removeClassMember('${cid}','${m.id}')">移除</button></td></tr>`).join("")
+        || `<tr><td colspan="4">${this.emptyHtml("暂无成员")}</td></tr>`}</tbody></table>
+      <div class="modal-actions"><button class="btn" onclick="App.closeModal()">关闭</button></div>`);
+  },
+  async addClassMembers(cid) {
+    const msg = document.getElementById("m-msg");
+    const usernames = document.getElementById("m-names").value.split(/[,，\s]+/).filter(Boolean);
+    try {
+      const r = await this.api("/api/classes/" + cid + "/members", "POST", { usernames });
+      msg.textContent = `已添加 ${r.added.length} 人` + (r.errors.length ? "；失败: " + r.errors.join("；") : "");
+      this.renderClassMembers(cid);
+    } catch (e) { msg.textContent = e.message; }
+  },
+  async removeClassMember(cid, uid) {
+    if (!confirm("确认移除该学员？")) return;
+    await this.api("/api/classes/" + cid + "/members/" + uid, "DELETE");
+    this.renderClassMembers(cid);
+  },
+
+  // ---------- 任务发布 ----------
+  async renderTasks() {
+    const c = document.getElementById("content");
+    const [data, clsData] = await Promise.all([
+      this.api("/api/tasks"), this.api("/api/classes")]);
+    c.innerHTML = `<div class="card"><div class="card-head"><h3>已发布任务</h3>
+      <button class="btn btn-primary" onclick="App.editTask()">+ 发布任务</button></div>
+      <table><thead><tr><th>标题</th><th>班级</th><th>流程</th><th>截止</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>${data.items.map(t => `<tr>
+        <td><b>${this.esc(t.title)}</b></td><td>${this.esc(t.class_name)}</td>
+        <td>${this.esc(t.process_name)}</td>
+        <td>${new Date((t.deadline || 0) * 1000).toLocaleString()}</td>
+        <td><span class="tag ${t.status === "published" ? "tag-green" : "tag-gray"}">${t.status === "published" ? "进行中" : "已关闭"}</span></td>
+        <td><button class="btn btn-sm btn-primary" onclick="App.editTask('${t.id}')">编辑</button>
+            <button class="btn btn-sm btn-danger" onclick="App.delTask('${t.id}')">删除</button></td>
+      </tr>`).join("") || `<tr><td colspan="6">${this.emptyHtml("暂无任务")}</td></tr>`}</tbody></table></div>`;
+    window._teacherClasses = clsData.items;
+  },
+  async editTask(tid) {
+    let t = { title: "", description: "", status: "published" };
+    if (tid) {
+      const data = await this.api("/api/tasks");
+      t = data.items.find(x => x.id === tid);
+    }
+    const procs = await this.api("/api/processes");
+    const clsOpts = (window._teacherClasses || []).map(x => `<option value="${x.id}">${this.esc(x.name)}</option>`).join("");
+    const procOpts = procs.items.map(p => `<option value="${p.id}">${this.esc(p.name)}</option>`).join("");
+    let deadlineVal = "";
+    if (t.deadline) {
+      const d = new Date(t.deadline * 1000);
+      const pad = n => String(n).padStart(2, "0");
+      deadlineVal = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    this.openModal(`
+      <h3>${tid ? "编辑" : "发布"}任务</h3>
+      <div class="form-row"><label>标题</label><input id="t-title" value="${this.esc(t.title)}"></div>
+      <div class="form-row"><label>班级</label><select id="t-class">${clsOpts.replace(`value="${t.class_id}"`, `value="${t.class_id}" selected`)}</select></div>
+      <div class="form-row"><label>流程</label><select id="t-proc">${procOpts.replace(`value="${t.process_id}"`, `value="${t.process_id}" selected`)}</select></div>
+      <div class="form-row"><label>截止时间</label>
+        <input id="t-deadline" type="datetime-local" value="${deadlineVal}"></div>
+      <div class="form-row"><label>描述（可选）</label><textarea id="t-desc">${this.esc(t.description || "")}</textarea></div>
+      <div class="modal-actions">
+        <button class="btn" onclick="App.closeModal()">取消</button>
+        <button class="btn btn-primary" onclick="App.saveTask('${tid || ""}')">保存</button>
+      </div>`);
+  },
+  async saveTask(tid) {
+    const deadline = new Date(document.getElementById("t-deadline").value).getTime();
+    const payload = {
+      title: document.getElementById("t-title").value.trim(),
+      class_id: document.getElementById("t-class").value,
+      process_id: document.getElementById("t-proc").value,
+      deadline: Math.floor(deadline / 1000),
+      description: document.getElementById("t-desc").value.trim(),
+    };
+    if (!payload.title || !deadline) { alert("标题与截止时间必填"); return; }
+    try {
+      if (tid) await this.api("/api/tasks/" + tid, "PUT", payload);
+      else await this.api("/api/tasks", "POST", payload);
+      this.closeModal(); this.go("tasks");
+    } catch (e) { alert(e.message); }
+  },
+  async delTask(tid) {
+    if (!confirm("确认删除该任务？")) return;
+    await this.api("/api/tasks/" + tid, "DELETE");
+    this.go("tasks");
+  },
+
+  // ---------- 我的任务 ----------
+  async renderMyTasks() {
+    const c = document.getElementById("content");
+    const data = await this.api("/api/tasks/mine");
+    window._myTasks = data.items;
+    const stateMap = { pending: ["tag-gray", "待完成"], overdue: ["tag-red", "已逾期"], done: ["tag-green", "已完成"] };
+    c.innerHTML = `<div class="card"><div class="card-head"><h3>我的任务</h3></div>
+      <div id="mytask-list"></div></div>`;
+    const list = document.getElementById("mytask-list");
+    if (!data.items.length) { list.innerHTML = this.emptyHtml("暂无任务，等待老师发布"); return; }
+    list.innerHTML = data.items.map(t => {
+      const [tagCls, tagTxt] = stateMap[t.state] || stateMap.pending;
+      return `<div class="card" style="box-shadow:none;border:1px solid var(--border)">
+        <div class="card-head"><h3>${this.esc(t.title)} <span class="tag ${tagCls}">${tagTxt}</span></h3>
+          <span style="color:var(--muted);font-size:12px">${t.latest_score == null ? "" : "最新得分 " + t.latest_score + " 分"}</span></div>
+        <p style="color:var(--muted);font-size:13px">班级：${this.esc(t.class_name)} ｜ 流程：${this.esc(t.process_name)}（${t.steps_count} 步）</p>
+        <p style="color:var(--muted);font-size:13px">截止：${new Date((t.deadline || 0) * 1000).toLocaleString()}</p>
+        <div style="margin-top:10px">
+          <button class="btn btn-primary btn-sm" onclick="App.startTaskPractice('${t.id}')">开始练习</button>
+        </div>
+      </div>`;
+    }).join("");
+  },
+  startTaskPractice(taskId) {
+    const task = (window._myTasks || []).find(t => t.id === taskId);
+    this.state.taskId = taskId;
+    this.state.taskTitle = task ? task.title : "任务练习";
+    this.go("assessment");
+  },
 };
+
+// ---------- 提效改造：教学看板 / 大屏 / 消息 / 步骤库 / 档案增强 ----------
+Object.assign(App, {
+  async renderLive() {
+    const c = document.getElementById("content");
+    this.state.liveFilter = this.state.liveFilter || "all";
+    c.innerHTML = `
+      <div class="card">
+        <div class="card-head"><h3>教学看板</h3>
+          <div style="display:flex;gap:8px">
+            <button class="btn" onclick="App.showThresholds()">阈值设置</button>
+            <button class="btn" onclick="window.open('/?tv=1','_blank')">大屏模式</button>
+          </div></div>
+        <div class="grid grid-4" id="live-stats"></div>
+        <div style="display:flex;gap:8px;margin:14px 0">
+          <button class="btn btn-sm" onclick="App.setLiveFilter('all')">全部进行中</button>
+          <button class="btn btn-sm" onclick="App.setLiveFilter('alert')">仅看异常</button>
+          <button class="btn btn-sm" onclick="App.setLiveFilter('off')">离屏</button>
+        </div>
+        <div id="live-sessions">加载中…</div>
+      </div>
+      <div class="card"><div class="card-head"><h3>完成后预警（最近记录）</h3></div>
+      <div id="live-alerts">加载中…</div></div>`;
+    await this.refreshLive();
+    if (this._liveTimer) clearInterval(this._liveTimer);
+    this._liveTimer = setInterval(() => this.refreshLive(), 3000);
+  },
+  setLiveFilter(f) { this.state.liveFilter = f; this.refreshLive(); },
+  async refreshLive() {
+    try {
+      const d = await this.api("/api/dashboard/live");
+      const levels = { ok: ["tag-green", "正常"], warn: ["tag-amber", "卡住"],
+        critical: ["tag-red", "严重卡顿"], off: ["tag-red", "离开画面"] };
+      const stats = [
+        { n: d.sessions.length, l: "在线练习" },
+        { n: d.sessions.filter(s => s.alert_level !== "ok").length, l: "实时异常" },
+        { n: d.alerts.length, l: "完成后预警" },
+        { n: d.thresholds ? d.thresholds.step_warn + "/" + d.thresholds.step_crit + "s" : "--", l: "卡住/严重阈值" },
+      ];
+      const st = document.getElementById("live-stats");
+      if (st) st.innerHTML = stats.map(s => `<div class="stat"><div class="num">${s.n}</div><div class="lbl">${s.l}</div></div>`).join("");
+      const filter = this.state.liveFilter || "all";
+      const rows = d.sessions.filter(s => filter === "all" ? true
+        : filter === "alert" ? s.alert_level !== "ok" : s.alert_level === "off");
+      const sEl = document.getElementById("live-sessions");
+      if (sEl) sEl.innerHTML = rows.length
+        ? `<table><thead><tr><th>学员</th><th>班级/任务</th><th>流程</th><th>当前步骤</th>
+            <th>停留</th><th>完成度</th><th>状态</th><th>操作</th></tr></thead><tbody>`
+          + rows.map(s => {
+            const [cls, txt] = levels[s.alert_level] || levels.ok;
+            return `<tr><td><b>${this.esc(s.user_name)}</b></td>
+              <td>${this.esc(s.class_name || "-")}<br><span style="color:var(--muted);font-size:12px">${this.esc(s.task_name || "-")}</span></td>
+              <td>${this.esc(s.process_name)}</td>
+              <td>第 ${(s.current_step ?? 0) + 1} 步</td>
+              <td>${s.step_stay}s</td>
+              <td>${s.score ?? "--"}%</td>
+              <td><span class="tag ${cls}">${txt}</span></td>
+              <td><button class="btn btn-sm" onclick="App.viewLiveFrame('${s.session_id}','${this.esc(s.user_name)}')">看画面</button>
+                  <button class="btn btn-sm btn-primary" onclick="App.messageModal('${s.user_id}','${this.esc(s.user_name)}')">发消息</button></td></tr>`;
+          }).join("") + "</tbody></table>"
+        : this.emptyHtml("暂无进行中的练习");
+      const aEl = document.getElementById("live-alerts");
+      if (aEl) aEl.innerHTML = d.alerts.length
+        ? `<table><thead><tr><th>学员</th><th>班级/任务</th><th>得分</th><th>遗漏</th>
+            <th>顺序错误</th><th>时间</th><th>操作</th></tr></thead><tbody>`
+          + d.alerts.map(a => `<tr><td>${this.esc(a.user_name)}</td>
+              <td>${this.esc(a.class_name || "-")}<br><span style="color:var(--muted);font-size:12px">${this.esc(a.task_name || "-")}</span></td>
+              <td>${a.score ?? "--"}</td><td>${a.missed}</td><td>${a.order_errors}</td>
+              <td>${new Date((a.started_at || 0) * 1000).toLocaleString()}</td>
+              <td><button class="btn btn-sm" onclick="App.renderAssessmentReport('${a.record_id}')">报告</button>
+                  <button class="btn btn-sm btn-primary" onclick="App.messageModal('${a.user_id}','${this.esc(a.user_name)}')">发消息</button></td></tr>`).join("")
+          + "</tbody></table>"
+        : this.emptyHtml("暂无完成后预警");
+    } catch (e) {}
+  },
+  viewLiveFrame(sid, name) {
+    this.openModal(`<h3>${this.esc(name)} · 实时画面</h3>
+      <img id="live-frame-img" style="width:100%;border-radius:8px;background:#111"
+        src="/api/monitoring/sessions/${sid}/frame?t=${Date.now()}">
+      <div class="modal-actions"><button class="btn" onclick="App.closeModal()">关闭</button></div>`);
+    if (this._frameModalTimer) clearInterval(this._frameModalTimer);
+    this._frameModalTimer = setInterval(() => {
+      const img = document.getElementById("live-frame-img");
+      if (!img) { clearInterval(this._frameModalTimer); this._frameModalTimer = null; return; }
+      img.src = "/api/monitoring/sessions/" + sid + "/frame?t=" + Date.now();
+    }, 300);
+  },
+  async showThresholds() {
+    const t = await this.api("/api/dashboard/thresholds");
+    this.openModal(`<h3>预警阈值设置</h3>
+      <div class="form-row"><label>当前步骤停留（秒）标黄</label><input type="number" id="th-warn" value="${t.step_warn}"></div>
+      <div class="form-row"><label>当前步骤停留（秒）标红</label><input type="number" id="th-crit" value="${t.step_crit}"></div>
+      <div class="form-row"><label>离开画面（秒）提示</label><input type="number" id="th-off" value="${t.off}"></div>
+      <div class="modal-actions"><button class="btn" onclick="App.closeModal()">取消</button>
+        <button class="btn btn-primary" onclick="App.saveThresholds()">保存</button></div>`);
+  },
+  async saveThresholds() {
+    const payload = { step_warn: Number(document.getElementById("th-warn").value),
+      step_crit: Number(document.getElementById("th-crit").value),
+      off: Number(document.getElementById("th-off").value) };
+    try {
+      await this.api("/api/dashboard/thresholds", "PUT", payload);
+      this.closeModal(); this.refreshLive();
+    } catch (e) { alert(e.message); }
+  },
+  messageModal(userId, name) {
+    this.openModal(`<h3>联系 ${this.esc(name)}</h3>
+      <div class="form-row"><label>内容</label><textarea id="msg-body" placeholder="填写提醒或点评内容"></textarea></div>
+      <div class="modal-actions">
+        <button class="btn" onclick="App.closeModal()">取消</button>
+        <button class="btn" onclick="App.sendToUser('${userId}', true)">存为私密备注</button>
+        <button class="btn btn-primary" onclick="App.sendToUser('${userId}', false)">发送消息</button>
+      </div>`);
+  },
+  async sendToUser(userId, asNote) {
+    const body = (document.getElementById("msg-body").value || "").trim();
+    if (!body) { alert("请填写内容"); return; }
+    try {
+      await this.api("/api/messages", "POST",
+        { to_user_id: userId, body, kind: asNote ? "note" : "message" });
+      this.closeModal();
+      if (!asNote) this.refreshUnread();
+    } catch (e) { alert(e.message); }
+  },
+  async refreshUnread() {
+    try {
+      const d = await this.api("/api/messages/unread-count");
+      const item = document.querySelector('.nav-item[data-view="messages"]');
+      if (!item) return;
+      item.innerHTML = d.count > 0
+        ? `消息 <span class="tag tag-red" style="margin-left:6px">${d.count}</span>`
+        : "消息";
+    } catch (e) {}
+  },
+  async renderMessages() {
+    const c = document.getElementById("content");
+    const data = await this.api("/api/messages/conversations");
+    this.state.msgPeer = this.state.msgPeer || null;
+    c.innerHTML = `<div class="card"><div class="card-head"><h3>消息</h3></div>
+      <div class="grid" style="grid-template-columns:280px 1fr;gap:16px">
+        <div id="msg-list"></div>
+        <div id="msg-thread" class="empty">选择左侧会话查看消息</div>
+      </div></div>`;
+    const list = document.getElementById("msg-list");
+    list.innerHTML = data.items.length ? data.items.map(m => `
+      <div class="step-item" style="cursor:pointer" onclick="App.openThread('${m.id}','${this.esc(m.name)}')">
+        <div style="flex:1"><b>${this.esc(m.name)}</b>
+          <div style="color:var(--muted);font-size:12px">${this.esc((m.last_body || "").slice(0, 16))}</div></div>
+        ${m.unread ? `<span class="tag tag-red">${m.unread}</span>` : ""}
+      </div>`).join("") : this.emptyHtml("暂无对话");
+    if (this.state.msgPeer) this.openThread(this.state.msgPeer);
+    this.refreshUnread();
+  },
+  async openThread(uid, name) {
+    this.state.msgPeer = uid;
+    const d = await this.api("/api/messages/thread/" + uid);
+    const box = document.getElementById("msg-thread");
+    if (!box) return;
+    box.className = "";
+    box.innerHTML = `<div style="max-height:420px;overflow-y:auto;padding-right:6px">
+      ${(d.items || []).map(m => {
+        const mine = m.from_user_id === (this.state.user && this.state.user.id);
+        const note = m.kind === "note";
+        return `<div style="margin:8px 0;text-align:${mine ? "right" : "left"}">
+          <span class="tag ${note ? "tag-amber" : mine ? "tag-blue" : "tag-gray"}">${note ? "私密备注" : mine ? "我" : this.esc(d.user.name)}</span>
+          <div style="margin-top:4px;white-space:pre-wrap">${this.esc(m.body || "")}</div>
+          <div style="color:var(--muted);font-size:11px">${new Date((m.created_at || 0) * 1000).toLocaleString()}</div>
+        </div>`;
+      }).join("") || this.emptyHtml("暂无消息")}
+    </div>
+    <div class="form-row" style="margin-top:12px"><textarea id="reply-body" placeholder="输入回复内容"></textarea></div>
+    <div style="text-align:right"><button class="btn btn-primary" onclick="App.sendReply('${uid}')">发送</button></div>`;
+    this.refreshUnread();
+  },
+  async sendReply(uid) {
+    const body = (document.getElementById("reply-body").value || "").trim();
+    if (!body) { alert("请输入内容"); return; }
+    try {
+      await this.api("/api/messages", "POST", { to_user_id: uid, body });
+      this.openThread(uid);
+    } catch (e) { alert(e.message); }
+  },
+  async renderTv() {
+    const c = document.getElementById("content");
+    this.state.tvTab = this.state.tvTab || "sessions";
+    c.innerHTML = `<div class="card">
+      <div class="card-head"><h3 style="font-size:24px">教学大屏</h3>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="App.setTvTab('sessions')">总览</button>
+          <button class="btn" onclick="App.setTvTab('alerts')">预警</button>
+          <button class="btn" onclick="App.setTvTab('classes')">班级进度</button>
+          <button class="btn" onclick="App.go('live')">退出大屏</button>
+        </div></div>
+      <div id="tv-body">加载中…</div></div>`;
+    await this.refreshTv();
+    if (this._tvTimer) clearInterval(this._tvTimer);
+    this._tvTimer = setInterval(() => this.refreshTv(), 5000);
+  },
+  setTvTab(t) { this.state.tvTab = t; this.refreshTv(); },
+  async refreshTv() {
+    const d = await this.api("/api/dashboard/live");
+    const tab = this.state.tvTab || "sessions";
+    const box = document.getElementById("tv-body");
+    if (!box) { if (this._tvTimer) { clearInterval(this._tvTimer); this._tvTimer = null; } return; }
+    if (tab === "alerts") {
+      box.innerHTML = d.alerts.length ? d.alerts.map(a => `
+        <div class="tv-row tv-alert"><b>${this.esc(a.user_name)}</b> · ${this.esc(a.class_name || "")} ·
+          得分 ${a.score ?? "--"} · 遗漏 ${a.missed} · 顺序错 ${a.order_errors}</div>`).join("")
+        : this.emptyHtml("暂无预警");
+    } else if (tab === "classes") {
+      const cls = await this.api("/api/classes");
+      const ongoing = {};
+      d.sessions.forEach(s => { ongoing[s.class_name || ""] = (ongoing[s.class_name || ""] || 0) + 1; });
+      box.innerHTML = `<table><thead><tr><th>班级</th><th>学员数</th><th>进行中</th></tr></thead><tbody>
+        ${cls.items.map(x => `<tr><td class="tv-cell">${this.esc(x.name)}</td>
+          <td class="tv-cell">${x.member_count}</td>
+          <td class="tv-cell">${ongoing[x.name] || 0}</td></tr>`).join("") || `<tr><td colspan="3">${this.emptyHtml("暂无班级")}</td></tr>`}
+      </tbody></table>`;
+    } else {
+      box.innerHTML = d.sessions.length ? d.sessions.map(s => `
+        <div class="tv-row"><b>${this.esc(s.user_name)}</b> · ${this.esc(s.class_name || "自由练习")} ·
+          ${this.esc(s.process_name)} · 第 ${(s.current_step ?? 0) + 1} 步 · 完成度 ${s.score ?? "--"}% ·
+          ${s.alert_level === "ok" ? "正常" : s.alert_level === "warn" ? "卡住" : s.alert_level === "critical" ? "严重卡顿" : "离开画面"}</div>`).join("")
+        : this.emptyHtml("暂无进行中的练习");
+    }
+  },
+  async renderLibrary(tab) {
+    this.state.libTab = tab || this.state.libTab || "processes";
+    if (this.state.libTab === "actions") await this.renderActions();
+    else await this.renderProcesses();
+    const c = document.getElementById("content");
+    if (!c) return;
+    c.insertAdjacentHTML("afterbegin", `<div class="card" style="padding:10px 20px">
+      <div style="display:flex;gap:8px">
+        <button class="btn ${this.state.libTab === "processes" ? "btn-primary" : ""}"
+          onclick="App.renderLibrary('processes')">护理流程</button>
+        <button class="btn ${this.state.libTab === "actions" ? "btn-primary" : ""}"
+          onclick="App.renderLibrary('actions')">动作模板</button>
+      </div></div>`);
+  },
+  async renderArchive() {
+    const c = document.getElementById("content");
+    const cls = await this.api("/api/classes");
+    c.innerHTML = `<div class="card"><div class="card-head"><h3>学员档案</h3>
+      <div style="display:flex;gap:8px">
+        <input id="archive-q" placeholder="搜索姓名或账号" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px">
+        <select id="archive-sort" onchange="App.loadArchive()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px">
+          <option value="name">按姓名</option>
+          <option value="avg_score">按平均分</option>
+          <option value="last_at">按最近练习</option>
+          <option value="warnings">按预警次数</option>
+        </select>
+        <select id="archive-class" onchange="App.loadArchive()">
+          <option value="">请选择班级</option>
+          ${cls.items.map(x => `<option value="${x.id}">${this.esc(x.name)}</option>`).join("")}
+        </select>
+      </div></div>
+      <div id="archive-list">${this.emptyHtml("先选择班级")}</div></div>`;
+  },
+  async loadArchive() {
+    const cid = document.getElementById("archive-class").value;
+    const q = encodeURIComponent((document.getElementById("archive-q") || {}).value || "");
+    const sort = (document.getElementById("archive-sort") || {}).value || "name";
+    const box = document.getElementById("archive-list");
+    if (!cid) { box.innerHTML = this.emptyHtml("先选择班级"); return; }
+    const d = await this.api(`/api/teacher/students?class_id=${cid}&q=${q}&sort=${sort}`);
+    box.innerHTML = `<table><thead><tr><th>学员</th><th>任务数</th><th>练习次数</th><th>平均分</th>
+      <th>预警次数</th><th>最近练习</th><th>操作</th></tr></thead>
+      <tbody>${d.items.map(s => `<tr>
+        <td><b>${this.esc(s.name)}</b>（${this.esc(s.username)}）</td>
+        <td>${s.tasks_done}</td><td>${s.records_count}</td>
+        <td>${s.avg_score == null ? "--" : s.avg_score}</td>
+        <td>${s.warnings || 0}</td>
+        <td>${s.last_at ? new Date(s.last_at * 1000).toLocaleString() : "--"}</td>
+        <td><button class="btn btn-sm btn-primary" onclick="App.loadStudentRecords('${s.id}')">查看记录</button>
+            <button class="btn btn-sm" onclick="App.messageModal('${s.id}','${this.esc(s.name)}')">发消息</button></td>
+      </tr>`).join("") || `<tr><td colspan="7">${this.emptyHtml("班级暂无学员")}</td></tr>`}</tbody></table>
+      <div id="student-records"></div>`;
+  },
+});
 
 // 点击遮罩关闭弹窗
 document.getElementById("modal-mask").addEventListener("click", e => {
@@ -750,4 +1545,7 @@ document.getElementById("modal-mask").addEventListener("click", e => {
 // 登录回车
 document.addEventListener("keydown", e => {
   if (e.key === "Enter" && !document.getElementById("login-view").classList.contains("hidden")) App.login();
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && App.state.view === "tv") App.go("live");
 });
