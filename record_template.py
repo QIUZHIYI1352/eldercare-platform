@@ -74,6 +74,7 @@ def main():
     # 详见 video_source.use_video_clock 的说明。
     video_clock = use_video_clock(args.source)
     frame_idx = 0
+    frame_wh = None          # 录制时的画面尺寸，用于事后比对宽高比
 
     while True:
         ok, frame = cap.read()
@@ -88,6 +89,8 @@ def main():
             frame = cv2.flip(frame, 1)
         display = frame.copy()
         h, w = frame.shape[:2]
+        if frame_wh is None:
+            frame_wh = (w, h)
 
         ok_pose, pts, pts3d = engine.detect(frame)
         now = (frame_idx / (cap.fps or 25.0)) if video_clock else time.time()
@@ -155,6 +158,14 @@ def main():
         # （见 pose_engine），而下采样到几十帧后失稳向量有相当概率留在模板里，
         # 会永久拉偏 DTW。存下这个字段，运行时才能识别并提示重录。
         "engine_mode": engine.mode,
+        # 录制时的画面尺寸。2d 空间的关节角由归一化坐标算出，而 mediapipe 用
+        # x/W、y/H 两个不同分母——**宽高比一变，角度就系统性偏移**（实测
+        # 16:9 -> 竖屏 9:16：躯干角 6.8° 变 20.7°，膝关节角 171° 变 154°，
+        # 等于虚报了一个屈膝动作）。分辨率高低本身无影响，只与比例有关。
+        # 存下它，才能在接入新视频源（尤其手机串流）时比对出这种静默偏移。
+        "frame_size": list(frame_wh) if frame_wh else None,
+        "frame_aspect": (round(frame_wh[0] / frame_wh[1], 3)
+                         if frame_wh and frame_wh[1] else None),
     }
 
     if args.action_id:

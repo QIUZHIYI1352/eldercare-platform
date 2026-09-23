@@ -145,3 +145,94 @@ def test_rule_joint_names_diverge_between_2d_and_3d():
     # 其中有条件在三维特征里是找不到的——这正是不能用三维特征判定规则的原因
     assert unknown_joints(seeded[0], set(f3d)), \
         "trunk_inclination 不应存在于三维特征里；若存在说明特征命名约定已变，请复核规则判定路径"
+
+
+# --------------------------------------------------------------------------
+# 二维特征与画面宽高比强相关（换视频源时必须一致）
+# --------------------------------------------------------------------------
+
+
+def _pixel_pose(trunk_lean_deg=12.0, knee_deg=150.0):
+    """构造一个**像素坐标**下的姿态（同一物理姿态，与画面尺寸无关）。
+
+    与 build() 不同：build() 直接给归一化坐标，而这里刻意从像素出发，
+    因为本组测试要变的正是「像素 -> 归一化」这一步（x/W、y/H）。
+    """
+    r = math.radians(trunk_lean_deg)
+    hx, hy, sy = 500.0, 400.0, 120.0
+    sx = hx + math.sin(r) * (hy - sy)
+    shy = hy - math.cos(r) * (hy - sy)
+    p = {
+        "left_shoulder": (sx - 60, shy), "right_shoulder": (sx + 60, shy),
+        "left_hip": (hx - 50, hy), "right_hip": (hx + 50, hy),
+        "nose": (sx, shy - 80),
+        "left_elbow": (sx - 100, shy + 90), "right_elbow": (sx + 100, shy + 90),
+        "left_wrist": (sx - 120, shy + 180), "right_wrist": (sx + 120, shy + 180),
+    }
+    leg = hy - sy
+    half = math.radians((180.0 - knee_deg) / 2.0)
+    for side, sgn in (("left", -1), ("right", 1)):
+        kx, ky = hx + sgn * 50, hy + leg
+        p[f"{side}_knee"] = (kx, ky)
+        p[f"{side}_ankle"] = (kx + sgn * math.sin(half) * leg,
+                              ky + math.cos(half) * leg)
+    return p
+
+
+def _features_at(pose_px, W, H):
+    pts = [(0.5, 0.5, 1.0)] * 33
+    for name, idx in LM.items():
+        if name in pose_px:
+            x, y = pose_px[name]
+            pts[idx] = (x / W, y / H, 1.0)
+    return PoseEngine.compute_features(pts)
+
+
+_ASPECT_KEYS = ["trunk_inclination", "left_knee_angle", "right_knee_angle",
+                "left_hip_angle", "right_hip_angle", "left_elbow_angle"]
+_POSE = _pixel_pose()
+
+
+def test_2d_features_are_invariant_to_resolution_at_same_aspect():
+    """同一宽高比下，分辨率高低（720p vs 1080p）不应改变任何特征。
+
+    这条是下面那条的对照组：证明敏感的是**比例**，不是像素数。
+    也说明「换个更高清的摄像头」本身无害。
+    """
+    a = _features_at(_POSE, 1280, 720)
+    b = _features_at(_POSE, 1920, 1080)
+    for k in _ASPECT_KEYS:
+        assert abs(a[k] - b[k]) < 1e-6, f"{k} 在 16:9 下随分辨率变化了：{a[k]} vs {b[k]}"
+
+
+def test_2d_features_shift_with_aspect_ratio():
+    """宽高比一变，二维角度就系统性偏移——**手机串流接入时最容易踩**。
+
+    根因：mediapipe 的归一化是 x/W、y/H（两个不同分母），
+    而 compute_features 直接用归一化坐标算夹角，于是比例会整体拉伸角度。
+
+    实测（构造姿态，躯干真值前倾 12°）：16:9 得 6.82°，竖屏 9:16 得 20.70°，
+    膝关节角 171° -> 154°（等于虚报了一个屈膝动作）。
+
+    因此：**录模板与运行时必须用同一宽高比**；否则改用 3d 特征空间
+    （米制三维坐标，不经过 W/H 归一化，天然免疫）。
+    若本测试失败，说明归一化方式变了——请同步更新模板录制里的
+    frame_aspect 标记与 check_source.py 的比对说明。
+    """
+    wide = _features_at(_POSE, 1280, 720)      # 16:9 横屏
+    four3 = _features_at(_POSE, 960, 720)      # 4:3
+    tall = _features_at(_POSE, 720, 1280)      # 9:16 手机竖屏
+
+    shift_4_3 = max(abs(four3[k] - wide[k]) for k in _ASPECT_KEYS)
+    shift_tall = max(abs(tall[k] - wide[k]) for k in _ASPECT_KEYS)
+
+    # 4:3 与 16:9 差距不大但不是零 —— 值得提示，不必报警
+    assert 1.0 < shift_4_3 < 6.0, f"4:3 的偏移量级与预期不符：{shift_4_3:.2f}°"
+    # 竖屏是**量级性**的差异，足以让匹配彻底失真
+    assert shift_tall > 10.0, (
+        f"竖屏偏移 {shift_tall:.2f}° 低于预期——"
+        f"若确实变小了，说明归一化已改进，请重新评估 frame_aspect 比对门槛"
+    )
+    assert tall["trunk_inclination"] > wide["trunk_inclination"] * 2, (
+        "竖屏下躯干角被显著放大这一现象应保持可复现"
+    )
