@@ -13,6 +13,10 @@
 `http://192.168.x.x` 会被直接拒绝。所以这里自签一张证书，
 手机上会提示"连接不私密"，点继续访问即可（数据不出局域网）。
 
+自签证书**不依赖任何 Python 第三方包**：优先用 openssl 命令行
+（Git for Windows 自带），没有才退回 cryptography。这样任何 Python 3.8+
+都能跑，不必纠结用哪个解释器。
+
 用法：
     python phone_cam.py
 然后按屏幕提示，用手机浏览器打开打印出来的地址。
@@ -22,13 +26,13 @@ import datetime
 import http.server
 import ipaddress
 import os
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
-
-sys.path.insert(0, ".")
 
 CERT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".workbuddy")
 CERT_PEM = os.path.join(CERT_DIR, "phone_cam_cert.pem")
@@ -55,21 +59,58 @@ def lan_ip():
         s.close()
 
 
-def ensure_cert(ips):
-    """自签证书（带 SAN）。已存在就直接复用。"""
-    if os.path.exists(CERT_PEM) and os.path.exists(KEY_PEM):
+def find_openssl():
+    """找 openssl 可执行文件（PATH 优先，其次 Git for Windows 的常见位置）。"""
+    exe = shutil.which("openssl")
+    if exe:
+        return exe
+    for p in (r"C:\Program Files\Git\usr\bin\openssl.exe",
+              r"C:\Program Files (x86)\Git\usr\bin\openssl.exe",
+              r"C:\Program Files\Git\mingw64\bin\openssl.exe"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _gen_with_openssl(ips):
+    """用 openssl 命令行生成自签证书——不需要任何 Python 包。"""
+    exe = find_openssl()
+    if not exe:
+        return False
+    os.makedirs(CERT_DIR, exist_ok=True)
+    names = ["DNS:localhost", "IP:127.0.0.1"]
+    for ip in sorted(set(ips)):
+        if ip != "127.0.0.1":
+            names.append(f"IP:{ip}")
+    cmd = [exe, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+           "-keyout", KEY_PEM, "-out", CERT_PEM, "-days", "3650",
+           "-subj", "/CN=phone-cam",
+           "-addext", "subjectAltName=" + ",".join(names)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        print(f"  openssl 调用失败：{e}")
+        return False
+    if r.returncode == 0 and os.path.exists(CERT_PEM) and os.path.exists(KEY_PEM):
+        print("  已用 openssl 生成（无需任何 Python 第三方包）")
         return True
+    detail = (r.stderr or "").strip().splitlines()
+    print("  openssl 生成失败：" + (detail[-1] if detail
+                                   else "退出码 %d（版本可能不支持 -addext）"
+                                        % r.returncode))
+    return False
+
+
+def _gen_with_cryptography(ips):
+    """退路：用 cryptography 包生成。只有没装 openssl 时才会走到这里。"""
     try:
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.x509.oid import NameOID
     except Exception:
-        print("!! 缺少 cryptography，无法生成证书。请执行：")
-        print("   pip install cryptography")
         return False
 
-    print("正在生成自签证书（首次运行一次，之后复用）...")
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "phone-cam")])
     san = [x509.DNSName("localhost")]
@@ -96,8 +137,40 @@ def ensure_cert(ips):
             encryption_algorithm=serialization.NoEncryption()))
     with open(CERT_PEM, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))
-    print(f"  证书已写入 {CERT_DIR}")
+    print("  已用 cryptography 生成")
     return True
+
+
+def ensure_cert(ips):
+    """自签证书（带 SAN）。已存在就直接复用。
+
+    顺序刻意如此：openssl 命令行**零依赖**，任何 Python 都能跑；
+    cryptography 只是没装 openssl 时的退路。
+    """
+    if os.path.exists(CERT_PEM) and os.path.exists(KEY_PEM):
+        return True
+    print("正在生成自签证书（首次运行一次，之后复用）...")
+    if _gen_with_openssl(ips) or _gen_with_cryptography(ips):
+        print(f"  证书已写入 {CERT_DIR}")
+        return True
+
+    print()
+    print("!! 无法生成证书：本机既没有 openssl，也没有 Python 的 cryptography 包。")
+    print("   任选其一即可：")
+    print("     a) 安装 Git for Windows（自带 openssl），然后重跑本脚本；")
+    print("     b) 执行  pip install cryptography   再重跑本脚本。")
+    return False
+
+
+def port_busy(port):
+    """端口是否已被占用（用于给出比 'Address already in use' 更清楚的提示）。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        s.close()
+
 
 
 # ------------------------------------------------------------------ 状态
@@ -345,15 +418,29 @@ def main():
     http_port = ARGS.port + 1
     ip = lan_ip()
 
+    # 端口先查，否则报 "Address already in use" 很难看出是重复启动
+    for p in (ARGS.port, http_port):
+        if port_busy(p):
+            print(f"!! 端口 {p} 已被占用。多半是已经启动过一个 phone_cam.py。")
+            print("   先关掉之前的那个（或换个端口）：")
+            print(f"     python phone_cam.py --port {ARGS.port + 100}")
+            sys.exit(3)
+
     if not ensure_cert([ip]):
         sys.exit(1)
 
-    serve(PhoneHandler, ARGS.port, use_ssl=True)
-    serve(StreamHandler, http_port, use_ssl=False)
+    try:
+        serve(PhoneHandler, ARGS.port, use_ssl=True)
+        serve(StreamHandler, http_port, use_ssl=False)
+    except OSError as e:
+        print(f"!! 启动失败：{e}")
+        print("   如提示端口被占用，换一个端口重试：python phone_cam.py --port 9443")
+        sys.exit(3)
 
     print("=" * 68)
     print("手机摄像头已就绪（手机端**不需要装任何 App**）")
     print("=" * 68)
+    print(f"  运行解释器：{sys.executable}")
     print()
     print("① 手机浏览器打开（与电脑同一个 WiFi）：")
     print()

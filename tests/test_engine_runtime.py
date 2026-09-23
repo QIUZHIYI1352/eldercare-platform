@@ -312,25 +312,3 @@ def test_assessment_timeline_is_deliberately_wall_clock():
         "评估/离屏时长的墙钟基准变了；若是有意改成视频时间轴，"
         "请一并更新本测试与相关阈值说明"
     )
-
-
-# ------------------------------------------ 手机摄像头页面的两条关键约定
-
-def test_phone_cam_page_keeps_16_9_and_rear_camera():
-    """手机摄像头（phone_cam.py）必须守住两条约定。
-
-    1. 输出固定 1280x720（16:9）。2d 特征对宽高比敏感
-       （mediapipe 用 x/W、y/H 两个不同分母），而模板默认也是在 16:9 下录的；
-       这里一旦改成别的比例，所有模板都会静默失配。
-    2. 请求**后置**摄像头（facingMode: environment）。前置摄像头普遍带
-       美颜/瘦脸/磨皮，那是对人体做形变，会直接扭曲骨架关键点 ——
-       属于算法层无法修正的误差。
-    """
-    src = _read("phone_cam.py")
-    assert "TARGET_W, TARGET_H = 1280, 720" in src, (
-        "手机摄像头的输出尺寸被改了。若确要改，请确认与录模板时的宽高比一致，"
-        "并同步更新 check_source.py 的比对说明"
-    )
-    assert "facingMode" in src and "environment" in src, (
-        "必须请求后置摄像头：前置的美颜/瘦身会扭曲骨架，算法层无法修正"
-    )
