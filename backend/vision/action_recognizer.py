@@ -18,6 +18,18 @@ OPS = {
     "!=": lambda a, b: abs(a - b) >= 1e-6,
 }
 
+# 规则条件的关节名必须出现在被判定的特征字典里，否则该条件恒为 False——
+# 动作会**静默失效**（既不报错也不命中），是最难排查的一类问题。
+# 例：三维特征的键名是 l_knee_angle，而规则里常用的是 left_knee_angle。
+def unknown_joints(conditions, available_keys):
+    """返回条件里引用了、但不在 available_keys 中的关节名。"""
+    out = set()
+    for cond in conditions or []:
+        j = cond.get("joint")
+        if j and j not in available_keys:
+            out.add(j)
+    return sorted(out)
+
 
 def evaluate_conditions(features, conditions):
     """判断当前特征是否满足一组条件（全部满足才为 True）。"""

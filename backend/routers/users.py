@@ -23,8 +23,15 @@ def list_users(user=Depends(current_user)):
 def create_user(payload: dict, user=Depends(current_user)):
     auth.require_role(user, ["admin"])
     username = (payload.get("username") or "").strip()
-    if not username or not payload.get("password"):
+    password = payload.get("password") or ""
+    if not username or not password:
         raise HTTPException(status_code=400, detail="用户名与密码必填")
+    if len(username) < 3 or len(username) > 64:
+        raise HTTPException(status_code=400, detail="用户名长度需在 3~64 位之间")
+    if any(ch.isspace() for ch in username):
+        raise HTTPException(status_code=400, detail="用户名不能包含空格")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少 6 位")
     if db.query_one("SELECT id FROM users WHERE username = ?", (username,)):
         raise HTTPException(status_code=409, detail="用户名已存在")
     role = payload.get("role") or "nursing_student"
@@ -33,9 +40,10 @@ def create_user(payload: dict, user=Depends(current_user)):
     uid = db.gen_id("user")
     db.execute(
         "INSERT INTO users (id, username, password_hash, name, role, organization, phone, created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (uid, username, auth.hash_password(payload.get("password")),
-         payload.get("name") or username, role,
-         payload.get("organization") or "", payload.get("phone") or "", db.now()),
+        (uid, username, auth.hash_password(password),
+         (payload.get("name") or username)[:64], role,
+         (payload.get("organization") or "")[:128],
+         (payload.get("phone") or "")[:32], db.now()),
     )
     auth.audit(user, "create_user", f"创建用户 {username}({ROLES[role]})")
     return {"id": uid}
@@ -44,6 +52,11 @@ def create_user(payload: dict, user=Depends(current_user)):
 @router.delete("/{uid}")
 def delete_user(uid: str, user=Depends(current_user)):
     auth.require_role(user, ["admin"])
+    if uid == user["id"]:
+        raise HTTPException(status_code=400, detail="不能删除当前登录的管理员账号")
     db.execute("DELETE FROM users WHERE id = ?", (uid,))
+    # 一并清理其会话与班级成员关系，避免残留脏数据
+    db.execute("DELETE FROM sessions WHERE user_id = ?", (uid,))
+    db.execute("DELETE FROM class_members WHERE user_id = ?", (uid,))
     auth.audit(user, "delete_user", f"删除用户 {uid}")
     return {"ok": True}

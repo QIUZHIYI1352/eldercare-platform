@@ -23,11 +23,13 @@ import argparse
 import sys
 import time
 
+import config
 from backend import database as db
-from backend.vision.pose_engine import PoseEngine
-from backend.vision.action_recognizer import ActionRecognizer
+from backend.vision.pose_engine import PoseEngine, DEFAULT_RUNNING_MODE
+from backend.vision.action_recognizer import ActionRecognizer, unknown_joints
 from backend.vision.sequence_matcher import match_sequence
-from backend.vision.template_matcher import TemplateMatcher, features_to_vector
+from backend.vision.template_matcher import (TemplateMatcher, features_to_vector,
+                                            template_compatible)
 from backend.vision.video_source import VideoSource
 
 try:
@@ -90,19 +92,46 @@ def resolve_source(args):
     return str(args.camera)
 
 
-def build_matchers(actions):
-    """区分 rule / sequence 动作，返回 (rule_actions, seq_matchers)。"""
+def build_matchers(actions, space):
+    """区分 rule / sequence 动作，返回 (rule_actions, seq_matchers)。
+
+    特征空间或**特征版本**不符的序列模板会被跳过而不是硬匹配——同一空间内特征
+    语义变更后旧模板的向量含义已变，拿它凑出的匹配结果就是误报。
+    """
     rule_actions = []
     seq_matchers = {}
+    skipped = []
     for a in actions:
         if a.get("template_type") == "sequence":
             td = a.get("template_data") or {}
             vectors = td.get("vectors") or []
-            if len(vectors) >= 2:
-                seq_matchers[a["id"]] = TemplateMatcher(
-                    vectors, threshold=float(td.get("threshold", 8.0)))
+            if len(vectors) < 2:
+                continue
+            ok, why = template_compatible(td, space, DEFAULT_RUNNING_MODE)
+            if not ok:
+                skipped.append((a.get("name") or a.get("id"), why))
+                continue
+            try:
+                th = float(td.get("threshold") or 0) or None
+                seq_matchers[a["id"]] = TemplateMatcher(vectors, threshold=th, space=space)
+            except ValueError as e:
+                skipped.append((a.get("name") or a.get("id"), str(e)))
         else:
             rule_actions.append(a)
+    if skipped:
+        print(f"  [模板跳过] 当前特征空间 FEATURE_SPACE={space}，以下序列模板不可用，"
+              f"需用同一版本重新录制：")
+        for name, why in skipped:
+            print(f"    - {name}（{why}）")
+    valid = set(PoseEngine.compute_features([(0.5, 0.5, 1.0)] * 33).keys())
+    bad = [(a.get("name") or a.get("id"), unknown_joints(a.get("conditions"), valid))
+           for a in rule_actions]
+    bad = [(n, m) for n, m in bad if m]
+    if bad:
+        print("  [规则告警] 以下动作引用了不存在的关节名，条件将恒不成立（不会被识别）：")
+        for name, miss in bad:
+            print(f"    - {name}：{', '.join(miss)}")
+        print(f"    可用关节名：{', '.join(sorted(valid))}")
     return rule_actions, seq_matchers
 
 
@@ -124,8 +153,10 @@ def main():
         print("动作模板为空，请先在后台添加识别动作")
         return
     action_map = {a["id"]: a for a in actions}
-    rule_actions, seq_matchers = build_matchers(actions)
-    print(f"动作模板: {len(rule_actions)} 个规则型, {len(seq_matchers)} 个序列型")
+    space = (getattr(config, "FEATURE_SPACE", "2d") or "2d").strip().lower()
+    rule_actions, seq_matchers = build_matchers(actions, space)
+    print(f"动作模板: {len(rule_actions)} 个规则型, {len(seq_matchers)} 个序列型"
+          f"（特征空间 FEATURE_SPACE={space}）")
 
     processes = load_processes()
     proc = pick_process(processes, args.process, args.process_id)
@@ -137,13 +168,14 @@ def main():
     print("步骤: " + " → ".join(s["name"] for s in proc["steps"]))
     print("按 q 退出；按 s 保存并结束\n")
 
-    engine = PoseEngine()
     recognizer = ActionRecognizer()
     source = resolve_source(args)
     cap = VideoSource(source)
     if not cap.open():
         print(f"无法打开视频源: {source}")
         return
+    # 用源的真实帧率初始化（VIDEO 模式据此生成帧间时间戳）
+    engine = PoseEngine(fps=cap.fps)
 
     detected_seq = []       # 已识别动作 id 序列（按时间）
     last_active = set()
@@ -153,20 +185,29 @@ def main():
     while True:
         ok, frame = cap.read()
         if not ok:
+            if cap.eof:
+                # 本地文件已读完：正常收尾（此前会被当成断流而无限空转）
+                print("\n视频文件已播放完毕，结束监控")
+                break
             # 断流重连中，短暂等待
             time.sleep(0.05)
             continue
         if source.isdigit():
             frame = cv2.flip(frame, 1)
 
-        ok_pose, pts = engine.landmarks_from_frame(frame)
+        ok_pose, pts, pts3d = engine.detect(frame)
         active = []          # 当前激活的 rule 动作 id
         if ok_pose:
-            features = PoseEngine.compute_features(pts)
+            # 规则条件写在**二维特征名**上（trunk_inclination、left_knee_angle…），
+            # 三维特征键名不同（l_knee_angle…）。故规则判定固定用二维特征，
+            # 与 FEATURE_SPACE 无关，否则切到 3d 空间会让规则型动作静默失效。
+            feats2d = PoseEngine.compute_features(pts)
+            features = (PoseEngine.compute_features_3d(pts3d)
+                        if space == "3d" and pts3d else feats2d)
             # 1) 规则型动作
-            active = recognizer.update(features, rule_actions)
+            active = recognizer.update(feats2d, rule_actions)
             # 2) 序列型动作（DTW）
-            vec = features_to_vector(features)
+            vec = features_to_vector(features, space)
             for aid, matcher in seq_matchers.items():
                 dist, hit = matcher.update(vec)
                 seq_status[aid] = dist

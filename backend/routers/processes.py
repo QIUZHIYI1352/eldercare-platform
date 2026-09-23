@@ -4,8 +4,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend import auth
 from backend import database as db
 from .auth_router import current_user
+from .tasks import TEACHER_ROLES
 
 router = APIRouter(prefix="/api/processes", tags=["processes"])
+
+
+def _require_manager(user):
+    """护理流程是培训标准，只有教师/管理员可维护；所有登录用户可读取。"""
+    if user["role"] not in TEACHER_ROLES:
+        raise HTTPException(status_code=403, detail="仅教师或管理员可维护培训标准流程")
 
 
 @router.get("")
@@ -28,6 +35,7 @@ def get_process(pid: str, user=Depends(current_user)):
 
 @router.post("")
 def create_process(payload: dict, user=Depends(current_user)):
+    _require_manager(user)
     name = (payload.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="流程名称必填")
@@ -43,6 +51,7 @@ def create_process(payload: dict, user=Depends(current_user)):
 
 @router.put("/{pid}")
 def update_process(pid: str, payload: dict, user=Depends(current_user)):
+    _require_manager(user)
     row = db.query_one("SELECT * FROM processes WHERE id = ?", (pid,))
     if not row:
         raise HTTPException(status_code=404, detail="流程不存在")
@@ -58,6 +67,7 @@ def update_process(pid: str, payload: dict, user=Depends(current_user)):
 
 @router.delete("/{pid}")
 def delete_process(pid: str, user=Depends(current_user)):
+    _require_manager(user)
     db.execute("DELETE FROM processes WHERE id = ?", (pid,))
     auth.audit(user, "delete_process", f"删除护理流程 {pid}")
     return {"ok": True}

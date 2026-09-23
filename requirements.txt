@@ -1,14 +1,20 @@
 # 智慧实训规范平台 依赖
+# 建议 Python 3.9 ~ 3.12（MediaPipe 尚未覆盖 3.13，numpy 1.x 也没有 3.13 轮子）
+
+# ---- Web 层（必装：只跑管理后台时只需这一组 + PyMySQL）----
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
 python-multipart>=0.0.9
 
-# 视觉识别核心
-# 注意：mediapipe>=1.0 使用 Tasks API（需自动下载 .task 模型，见 backend/vision/pose_engine.py）
+# ---- 视觉识别（可选；不装则后台仍可运行，「实时监控/动作对比」不可用）----
+# mediapipe>=1.0 使用 Tasks API（首次运行自动下载 .task 模型，见 backend/vision/pose_engine.py）
 numpy>=1.26,<2.0
 opencv-contrib-python>=4.10,<5.0
 mediapipe>=1.0
 
-# MySQL 数据层（SQLite 已切换）
+# ---- 数据层（必装）----
+# 数据层已从 SQLite 切换为 MySQL 8
 PyMySQL>=1.1
+
+# 开发/测试用的额外依赖见 requirements-dev.txt

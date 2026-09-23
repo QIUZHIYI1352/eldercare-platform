@@ -9,12 +9,22 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend import auth
 from backend import database as db
 from .auth_router import current_user
+from .tasks import TEACHER_ROLES
 
 router = APIRouter(prefix="/api/actions", tags=["actions"])
 
+
+def _require_manager(user):
+    """动作模板属于培训标准，只有教师/管理员可维护；所有登录用户可读取。"""
+    if user["role"] not in TEACHER_ROLES:
+        raise HTTPException(status_code=403, detail="仅教师或管理员可维护动作模板")
+
 # 可供规则引用的关节特征说明
 JOINT_FIELDS = [
-    {"key": "trunk_inclination", "label": "躯干前倾角(度)", "note": "0=直立，越大越前倾"},
+    # trunk_inclination 是「躯干与竖直轴的无符号夹角」：前倾与后仰数值相同，
+    # 不区分方向；>90 表示头低于髋。见 backend/vision/pose_engine.py 的同名注释。
+    {"key": "trunk_inclination", "label": "躯干偏离直立角(度)",
+     "note": "0=直立，90=躯干水平，越大偏离直立越多（不区分前倾/后仰）"},
     {"key": "trunk_lateral_lean", "label": "躯干侧倾角(度)", "note": "正值=右倾"},
     {"key": "left_elbow_angle", "label": "左肘角度(度)", "note": "180=伸直, 90=弯曲"},
     {"key": "right_elbow_angle", "label": "右肘角度(度)", "note": "180=伸直, 90=弯曲"},
@@ -35,7 +45,11 @@ _TEMPLATE_TYPES = {"rule", "sequence"}
 
 
 def _summarize(row):
-    """把 template_data 摘要化，避免列表接口返回过大的向量数据。"""
+    """把 template_data 摘要化，避免列表接口返回过大的向量数据。
+
+    只保留帧数与阈值等标量摘要；序列模板的完整 vectors 仅在
+    单条详情接口（GET /api/actions/{aid}）返回，防止列表响应体积失控。
+    """
     td = db.json_load(row.get("template_data"), {})
     if isinstance(td, dict):
         row["template_frames"] = len(td.get("vectors") or [])
@@ -43,7 +57,8 @@ def _summarize(row):
     else:
         row["template_frames"] = 0
         row["template_threshold"] = 8.0
-    row["_template_data"] = td
+    # 列表不返回完整模板数据（可能含上千帧 × 16 维向量）
+    row.pop("template_data", None)
     return row
 
 
@@ -88,15 +103,18 @@ def get_action(aid: str, user=Depends(current_user)):
 
 @router.get("")
 def list_actions(user=Depends(current_user)):
-    rows = db.query("SELECT * FROM actions ORDER BY created_at DESC")
+    rows = db.query("SELECT id, name, category, description, conditions, duration, "
+                    "sample_ref, template_type, template_data, created_by, created_at "
+                    "FROM actions ORDER BY created_at DESC")
     for r in rows:
         r["conditions"] = db.json_load(r.get("conditions"))
-        r = _summarize(r)
+        _summarize(r)
     return {"items": rows}
 
 
 @router.post("")
 def create_action(payload: dict, user=Depends(current_user)):
+    _require_manager(user)
     name = (payload.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="动作名称必填")
@@ -115,6 +133,7 @@ def create_action(payload: dict, user=Depends(current_user)):
 
 @router.put("/{aid}")
 def update_action(aid: str, payload: dict, user=Depends(current_user)):
+    _require_manager(user)
     row = db.query_one("SELECT * FROM actions WHERE id = ?", (aid,))
     if not row:
         raise HTTPException(status_code=404, detail="动作不存在")
@@ -134,6 +153,7 @@ def update_action(aid: str, payload: dict, user=Depends(current_user)):
 
 @router.delete("/{aid}")
 def delete_action(aid: str, user=Depends(current_user)):
+    _require_manager(user)
     db.execute("DELETE FROM actions WHERE id = ?", (aid,))
     auth.audit(user, "delete_action", f"删除识别动作 {aid}")
     return {"ok": True}

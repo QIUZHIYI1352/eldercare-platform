@@ -4,8 +4,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend import auth
 from backend import database as db
 from .auth_router import current_user
+from .tasks import TEACHER_ROLES
 
 router = APIRouter(prefix="/api/devices", tags=["devices"])
+
+
+def _require_manager(user):
+    """监控设备接入属于管理动作，只有教师/管理员可维护；所有登录用户可读取。"""
+    if user["role"] not in TEACHER_ROLES:
+        raise HTTPException(status_code=403, detail="仅教师或管理员可维护监控设备")
 
 
 @router.get("")
@@ -16,6 +23,7 @@ def list_devices(user=Depends(current_user)):
 
 @router.post("")
 def create_device(payload: dict, user=Depends(current_user)):
+    _require_manager(user)
     name = (payload.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="设备名称必填")
@@ -32,6 +40,7 @@ def create_device(payload: dict, user=Depends(current_user)):
 
 @router.put("/{did}")
 def update_device(did: str, payload: dict, user=Depends(current_user)):
+    _require_manager(user)
     row = db.query_one("SELECT * FROM devices WHERE id = ?", (did,))
     if not row:
         raise HTTPException(status_code=404, detail="设备不存在")
@@ -47,6 +56,7 @@ def update_device(did: str, payload: dict, user=Depends(current_user)):
 
 @router.delete("/{did}")
 def delete_device(did: str, user=Depends(current_user)):
+    _require_manager(user)
     db.execute("DELETE FROM devices WHERE id = ?", (did,))
     auth.audit(user, "delete_device", f"删除监控设备 {did}")
     return {"ok": True}

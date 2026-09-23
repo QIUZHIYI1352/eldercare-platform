@@ -191,6 +191,18 @@ const App = {
   // ---------- 通用 ----------
   esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); },
+  // 内联事件处理器里的 JS 字符串字面量参数专用转义。
+  // esc() 产出的 &#39; 会被浏览器解码回单引号，仍能闭合 '…' 造成 XSS，
+  // 因此这里按 JS 字面量转义，并把 HTML 敏感字符写成 \xNN 形式。
+  jss(s) { return String(s == null ? "" : s)
+    .replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/"/g, "\\x22")
+    .replace(/&/g, "\\x26").replace(/</g, "\\x3c").replace(/>/g, "\\x3e")
+    .replace(/[\r\n\u2028\u2029]/g, " "); },
+  // 画面帧地址：<img> 无法带 Authorization 头，改用 token 查询参数鉴权
+  frameUrl(sid) {
+    return "/api/monitoring/sessions/" + sid + "/frame?token="
+      + encodeURIComponent(this.state.token || "") + "&t=" + Date.now();
+  },
   openModal(html) {
     document.getElementById("modal-body").innerHTML = html;
     document.getElementById("modal-mask").classList.remove("hidden");
@@ -302,7 +314,7 @@ const App = {
       </div>
       <div class="modal-actions">
         <button class="btn" onclick="App.closeModal()">取消</button>
-        <button class="btn btn-primary" onclick="App.saveProcess('${pid || ""}', '${this.esc(p.category)}')">保存</button>
+        <button class="btn btn-primary" onclick="App.saveProcess('${pid || ""}')">保存</button>
       </div>`);
     window._actionOpts = actionOpts;
   },
@@ -629,7 +641,7 @@ const App = {
     const sid = this.state.monSession;
     if (!sid) return;
     const img = document.getElementById("mon-stream") || document.getElementById("as-stream");
-    if (img) img.src = "/api/monitoring/sessions/" + sid + "/frame?t=" + Date.now();
+    if (img) img.src = this.frameUrl(sid);
   },
   async stopMonitor(silent) {
     if (this.state.monSession) {
@@ -1002,70 +1014,9 @@ const App = {
     } catch (e) { alert(e.message); }
   },
 
-  // ---------- 预警看板 ----------
-  async renderLive() {
-    const c = document.getElementById("content");
-    c.innerHTML = `<div class="card"><div class="card-head"><h3>进行中练习</h3></div>
-      <div id="live-sessions">加载中…</div></div>
-      <div class="card"><div class="card-head"><h3>预警（总分<60 / 遗漏 / 顺序错误）</h3></div>
-      <div id="live-alerts">加载中…</div></div>`;
-    await this.refreshLive();
-    if (this._liveTimer) clearInterval(this._liveTimer);
-    this._liveTimer = setInterval(() => this.refreshLive(), 3000);
-  },
-  async refreshLive() {
-    try {
-      const d = await this.api("/api/dashboard/live");
-      const sEl = document.getElementById("live-sessions");
-      if (sEl) {
-        sEl.innerHTML = d.sessions.length ? d.sessions.map(s => `
-          <div class="step-item"><span class="order">${this.esc((s.user_name || "?").slice(0, 1))}</span>
-            <span>${this.esc(s.user_name)}${s.class_name ? " · " + this.esc(s.class_name) : ""}
-            ${s.task_name ? " · " + this.esc(s.task_name) : ""}</span>
-            <span style="margin-left:auto">${this.esc(s.process_name)} · 完成度 ${s.score ?? "--"}%</span></div>`).join("")
-          : this.emptyHtml("暂无进行中的练习");
-      }
-      const aEl = document.getElementById("live-alerts");
-      if (aEl) {
-        aEl.innerHTML = d.alerts.length ? d.alerts.map(a => `
-          <div class="step-item ${a.missed || a.order_errors ? "miss" : ""}">
-            <span>${this.esc(a.user_name)}${a.class_name ? " · " + this.esc(a.class_name) : ""}
-            ${a.task_name ? " · " + this.esc(a.task_name) : ""}</span>
-            <span style="margin-left:auto;font-size:12px">
-              得分 ${a.score ?? "--"}｜遗漏 ${a.missed}｜顺序错 ${a.order_errors}
-              <button class="btn btn-sm" onclick="App.renderAssessmentReport('${a.record_id}')">报告</button></span>
-          </div>`).join("")
-          : this.emptyHtml("暂无预警记录");
-      }
-    } catch (e) {}
-  },
+  // 说明：教学看板（renderLive/refreshLive）与学员档案（renderArchive/loadArchive）
+  // 的统一实现位于文件末尾的“提效改造”区块，此处不再重复定义，避免误改死代码。
 
-  // ---------- 学员档案 ----------
-  async renderArchive() {
-    const c = document.getElementById("content");
-    const cls = await this.api("/api/classes");
-    c.innerHTML = `<div class="card"><div class="card-head"><h3>学员档案</h3>
-      <select id="archive-class" onchange="App.loadArchive()">
-        <option value="">请选择班级</option>
-        ${cls.items.map(x => `<option value="${x.id}">${this.esc(x.name)}</option>`).join("")}
-      </select></div>
-      <div id="archive-list">${this.emptyHtml("先选择班级")}</div></div>`;
-  },
-  async loadArchive() {
-    const cid = document.getElementById("archive-class").value;
-    const box = document.getElementById("archive-list");
-    if (!cid) { box.innerHTML = this.emptyHtml("先选择班级"); return; }
-    const d = await this.api("/api/teacher/students?class_id=" + cid);
-    box.innerHTML = `<table><thead><tr><th>学员</th><th>任务数</th><th>练习次数</th><th>平均分</th><th>最近练习</th><th>操作</th></tr></thead>
-      <tbody>${d.items.map(s => `<tr>
-        <td><b>${this.esc(s.name)}</b>（${this.esc(s.username)}）</td>
-        <td>${s.tasks_done}</td><td>${s.records_count}</td>
-        <td>${s.avg_score == null ? "--" : s.avg_score}</td>
-        <td>${s.last_at ? new Date(s.last_at * 1000).toLocaleString() : "--"}</td>
-        <td><button class="btn btn-sm btn-primary" onclick="App.loadStudentRecords('${s.id}')">查看记录</button></td>
-      </tr>`).join("") || `<tr><td colspan="6">${this.emptyHtml("班级暂无学员")}</td></tr>`}</tbody></table>
-      <div id="student-records"></div>`;
-  },
   async loadStudentRecords(uid) {
     const box = document.getElementById("student-records");
     const d = await this.api("/api/teacher/students/" + uid + "/records");
@@ -1314,8 +1265,8 @@ Object.assign(App, {
               <td>${s.step_stay}s</td>
               <td>${s.score ?? "--"}%</td>
               <td><span class="tag ${cls}">${txt}</span></td>
-              <td><button class="btn btn-sm" onclick="App.viewLiveFrame('${s.session_id}','${this.esc(s.user_name)}')">看画面</button>
-                  <button class="btn btn-sm btn-primary" onclick="App.messageModal('${s.user_id}','${this.esc(s.user_name)}')">发消息</button></td></tr>`;
+              <td><button class="btn btn-sm" onclick="App.viewLiveFrame('${s.session_id}','${this.jss(s.user_name)}')">看画面</button>
+                  <button class="btn btn-sm btn-primary" onclick="App.messageModal('${s.user_id}','${this.jss(s.user_name)}')">发消息</button></td></tr>`;
           }).join("") + "</tbody></table>"
         : this.emptyHtml("暂无进行中的练习");
       const aEl = document.getElementById("live-alerts");
@@ -1327,7 +1278,7 @@ Object.assign(App, {
               <td>${a.score ?? "--"}</td><td>${a.missed}</td><td>${a.order_errors}</td>
               <td>${new Date((a.started_at || 0) * 1000).toLocaleString()}</td>
               <td><button class="btn btn-sm" onclick="App.renderAssessmentReport('${a.record_id}')">报告</button>
-                  <button class="btn btn-sm btn-primary" onclick="App.messageModal('${a.user_id}','${this.esc(a.user_name)}')">发消息</button></td></tr>`).join("")
+                  <button class="btn btn-sm btn-primary" onclick="App.messageModal('${a.user_id}','${this.jss(a.user_name)}')">发消息</button></td></tr>`).join("")
           + "</tbody></table>"
         : this.emptyHtml("暂无完成后预警");
     } catch (e) {}
@@ -1335,13 +1286,13 @@ Object.assign(App, {
   viewLiveFrame(sid, name) {
     this.openModal(`<h3>${this.esc(name)} · 实时画面</h3>
       <img id="live-frame-img" style="width:100%;border-radius:8px;background:#111"
-        src="/api/monitoring/sessions/${sid}/frame?t=${Date.now()}">
+        src="${this.frameUrl(sid)}">
       <div class="modal-actions"><button class="btn" onclick="App.closeModal()">关闭</button></div>`);
     if (this._frameModalTimer) clearInterval(this._frameModalTimer);
     this._frameModalTimer = setInterval(() => {
       const img = document.getElementById("live-frame-img");
       if (!img) { clearInterval(this._frameModalTimer); this._frameModalTimer = null; return; }
-      img.src = "/api/monitoring/sessions/" + sid + "/frame?t=" + Date.now();
+      img.src = this.frameUrl(sid);
     }, 300);
   },
   async showThresholds() {
@@ -1402,7 +1353,7 @@ Object.assign(App, {
       </div></div>`;
     const list = document.getElementById("msg-list");
     list.innerHTML = data.items.length ? data.items.map(m => `
-      <div class="step-item" style="cursor:pointer" onclick="App.openThread('${m.id}','${this.esc(m.name)}')">
+      <div class="step-item" style="cursor:pointer" onclick="App.openThread('${m.id}','${this.jss(m.name)}')">
         <div style="flex:1"><b>${this.esc(m.name)}</b>
           <div style="color:var(--muted);font-size:12px">${this.esc((m.last_body || "").slice(0, 16))}</div></div>
         ${m.unread ? `<span class="tag tag-red">${m.unread}</span>` : ""}
@@ -1532,7 +1483,7 @@ Object.assign(App, {
         <td>${s.warnings || 0}</td>
         <td>${s.last_at ? new Date(s.last_at * 1000).toLocaleString() : "--"}</td>
         <td><button class="btn btn-sm btn-primary" onclick="App.loadStudentRecords('${s.id}')">查看记录</button>
-            <button class="btn btn-sm" onclick="App.messageModal('${s.id}','${this.esc(s.name)}')">发消息</button></td>
+            <button class="btn btn-sm" onclick="App.messageModal('${s.id}','${this.jss(s.name)}')">发消息</button></td>
       </tr>`).join("") || `<tr><td colspan="7">${this.emptyHtml("班级暂无学员")}</td></tr>`}</tbody></table>
       <div id="student-records"></div>`;
   },

@@ -7,6 +7,12 @@
     python record_template.py --name "协助翻身动作" --duration 5
     python record_template.py --name "拍背排痰" --source rtsp://user:pwd@ip:554/stream1 --duration 6
     python record_template.py --name "环抱转移" --action-id act_xxx   # 覆盖已有动作的模板
+    python record_template.py --name "翻身" --space 3d                # 录「机位无关」模板
+
+特征空间（--space）：
+    2d  图像空间特征。机位必须固定；换个机位就得重录。
+    3d  三维机位无关特征。**多机位可共用同一套模板**，是解决
+        "换机位就要重录" 的方案。需要 mediapipe 提供 pose_world_landmarks。
 
 流程：打开视频源 → 倒计时 → 按提示在镜头前完成该动作 → 自动保存模板。
 """
@@ -17,10 +23,12 @@ import time
 import cv2
 import numpy as np
 
+import config
 from backend import database as db
 from backend.vision.pose_engine import PoseEngine
-from backend.vision.template_matcher import features_to_vector, down_sample
-from backend.vision.video_source import VideoSource
+from backend.vision.template_matcher import (FEATURE_VERSION, DEFAULT_THRESHOLD,
+                                             SPACE_3D, down_sample, features_to_vector)
+from backend.vision.video_source import VideoSource, use_video_clock
 
 
 def main():
@@ -29,7 +37,10 @@ def main():
     parser.add_argument("--name", required=True, help="动作名称")
     parser.add_argument("--source", default="0", help="视频源: 0 / rtsp:// / http:// / 文件路径")
     parser.add_argument("--duration", type=float, default=5.0, help="录制时长(秒)")
-    parser.add_argument("--threshold", type=float, default=8.0, help="DTW 归一化距离阈值")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="DTW 归一化距离阈值（默认按特征空间取值：2d=8.0, 3d=40.0）")
+    parser.add_argument("--space", default=None, choices=["2d", "3d"],
+                        help="特征空间：2d=机位必须固定；3d=多机位可共用同一套模板")
     parser.add_argument("--countdown", type=float, default=3.0, help="开始前倒计时(秒)")
     parser.add_argument("--frames", type=int, default=40, help="下采样目标帧数")
     parser.add_argument("--category", default="通用")
@@ -37,32 +48,49 @@ def main():
     parser.add_argument("--action-id", default=None, help="更新已有动作时传入其 id")
     args = parser.parse_args()
 
-    engine = PoseEngine()
+    space = (args.space or getattr(config, "FEATURE_SPACE", "2d")).strip().lower()
+    if args.threshold is None:
+        args.threshold = DEFAULT_THRESHOLD.get(space, 8.0)
+
     cap = VideoSource(args.source)
     if not cap.open():
         print(f"无法打开视频源: {args.source}")
         return
+    # 用源的真实帧率初始化（VIDEO 模式据此生成帧间时间戳）；
+    # 录制模板与运行时必须同为 VIDEO 模式，特征的时间平滑才一致。
+    engine = PoseEngine(fps=cap.fps)
 
     print(f"\n录制动作: {args.name}")
+    print(f"特征空间: {space}（{'机位无关，可多机位共用' if space == SPACE_3D else '机位需固定'}）")
     print(f"倒计时 {args.countdown} 秒后开始，请在镜头前完整演示该动作（约 {args.duration} 秒）")
 
     vectors = []
     state = "countdown"
     start_ts = None
     last_frame = None
+    saw_world = False
+    # 文件源按「视频时间轴」计时，摄像头/流按墙钟。
+    # 用墙钟量文件会造成「--duration 5 实际覆盖 4~9 秒不等的素材」，
+    # 详见 video_source.use_video_clock 的说明。
+    video_clock = use_video_clock(args.source)
+    frame_idx = 0
 
     while True:
         ok, frame = cap.read()
         if not ok:
+            if cap.eof:
+                print("\n视频文件已读完，结束采集")
+                break
             time.sleep(0.05)
             continue
+        frame_idx += 1
         if args.source.isdigit():
             frame = cv2.flip(frame, 1)
         display = frame.copy()
         h, w = frame.shape[:2]
 
-        ok_pose, pts = engine.landmarks_from_frame(frame)
-        now = time.time()
+        ok_pose, pts, pts3d = engine.detect(frame)
+        now = (frame_idx / (cap.fps or 25.0)) if video_clock else time.time()
 
         if state == "countdown":
             remaining = args.countdown - (now - (start_ts or now))
@@ -71,15 +99,21 @@ def main():
                 remaining = args.countdown
             if remaining <= 0:
                 state = "recording"
-                rec_start = time.time()
+                rec_start = now
             else:
                 cv2.putText(display, f"准备: {int(remaining) + 1} 秒后开始录制",
                             (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
         elif state == "recording":
-            elapsed = time.time() - rec_start
+            elapsed = now - rec_start
             if ok_pose:
-                features = PoseEngine.compute_features(pts)
-                vectors.append(features_to_vector(features))
+                if space == SPACE_3D:
+                    if pts3d:
+                        saw_world = True
+                        features = PoseEngine.compute_features_3d(pts3d)
+                        vectors.append(features_to_vector(features, space))
+                else:
+                    features = PoseEngine.compute_features(pts)
+                    vectors.append(features_to_vector(features, space))
             cv2.putText(display, f"录制中... {elapsed:.1f}s / 已采集 {len(vectors)} 帧",
                         (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             if elapsed >= args.duration:
@@ -104,9 +138,24 @@ def main():
         print(f"录制的有效骨骼帧不足（{len(vectors)} 帧），请确保全身入镜并完整演示动作")
         return
 
+    if space == SPACE_3D and not saw_world:
+        print("!! 当前 mediapipe 未返回 pose_world_landmarks（三维关键点），无法录制 3D 模板。")
+        print("   请确认 mediapipe 版本，或改用 --space 2d。")
+        return
+
     # 下采样到固定帧数
     vectors = down_sample(vectors, args.frames).tolist()
-    template_data = {"vectors": vectors, "threshold": args.threshold, "frames": len(vectors)}
+    template_data = {
+        "vectors": vectors,
+        "threshold": args.threshold,
+        "frames": len(vectors),
+        "space": space,
+        "version": FEATURE_VERSION.get(space, 1),
+        # 记录模板是用哪个推理模式录的。IMAGE 模式约 3.7% 的帧会失稳
+        # （见 pose_engine），而下采样到几十帧后失稳向量有相当概率留在模板里，
+        # 会永久拉偏 DTW。存下这个字段，运行时才能识别并提示重录。
+        "engine_mode": engine.mode,
+    }
 
     if args.action_id:
         row = db.query_one("SELECT * FROM actions WHERE id = ?", (args.action_id,))
@@ -118,7 +167,8 @@ def main():
             ("sequence", db.json_dump(template_data),
              args.name, args.category, args.description or row["description"], args.action_id),
         )
-        print(f"已更新动作 {args.name} 的骨骼序列模板（{len(vectors)} 帧）")
+        print(f"已更新动作 {args.name} 的骨骼序列模板"
+              f"（{len(vectors)} 帧, 空间 {space}, 阈值 {args.threshold}）")
     else:
         aid = db.gen_id("act")
         db.execute(
@@ -126,7 +176,11 @@ def main():
             (aid, args.name, args.category, args.description, "[]", 1.0, "",
              "sequence", db.json_dump(template_data), "recorder", db.now()),
         )
-        print(f"已保存序列动作模板: {args.name} (id={aid}, {len(vectors)} 帧, 阈值 {args.threshold})")
+        print(f"已保存序列动作模板: {args.name} "
+              f"(id={aid}, {len(vectors)} 帧, 空间 {space}, 阈值 {args.threshold})")
+
+    print("\n提示：阈值请用 calibrate_template.py 在本机实拍标定后再固化——")
+    print("      仿真标定的 3d 阈值 40.0 是起点，不是实测值。")
 
 
 if __name__ == "__main__":

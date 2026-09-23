@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 
+import config
 from backend import database as db
 
 try:
@@ -15,23 +16,70 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None
 
-from backend.vision.pose_engine import PoseEngine
-from backend.vision.action_recognizer import ActionRecognizer
+from backend.vision.pose_engine import PoseEngine, DEFAULT_RUNNING_MODE
+from backend.vision.action_recognizer import ActionRecognizer, unknown_joints
 from backend.vision.sequence_matcher import match_sequence
-from backend.vision.template_matcher import TemplateMatcher, features_to_vector
-from backend.vision.video_source import VideoSource
+from backend.vision.template_matcher import (TemplateMatcher, features_to_vector,
+                                            template_compatible)
 
 
-def _build_matchers(actions):
-    rule, seq = [], {}
+def _warn_unknown_joints(rule_actions):
+    """对引用了不存在关节名的规则型动作给出告警。
+
+    这类动作的条件恒为 False，既不报错也不命中——纯静默失效，最难排查。
+    宁可启动时刷一行日志，也不要让它无声地什么都不做。
+    """
+    try:
+        valid = set(PoseEngine.compute_features([(0.5, 0.5, 1.0)] * 33).keys())
+    except Exception:
+        return
+    bad = []
+    for a in rule_actions:
+        miss = unknown_joints(a.get("conditions"), valid)
+        if miss:
+            bad.append((a.get("name") or a.get("id"), miss))
+    if bad:
+        print("  [规则告警] 以下动作引用了不存在的关节名，条件将恒不成立（不会被识别）：")
+        for name, miss in bad:
+            print(f"    - {name}：{', '.join(miss)}")
+        print(f"    可用关节名：{', '.join(sorted(valid))}")
+
+
+def _build_matchers(actions, space, engine_mode=DEFAULT_RUNNING_MODE):
+    """构建匹配器。
+
+    特征空间或**特征版本**不符的模板会被**跳过**而不是拿去硬匹配——同一空间内
+    特征语义变更后，旧模板存的向量含义已经变了；宁可不报警，也不能用它凑出一个
+    匹配结果（那等于误报）。
+    注意：必须同时比对 space 与 version，只比 space 挡不住语义变更。
+
+    engine_mode 用于额外拒绝「用 IMAGE 模式录的模板」——那种模板可能含失稳向量，
+    会永久拉偏 DTW。详见 template_compatible。
+    """
+    rule, seq, skipped = [], {}, []
     for a in actions:
         if a.get("template_type") == "sequence":
             td = a.get("template_data") or {}
             vectors = td.get("vectors") or []
-            if len(vectors) >= 2:
-                seq[a["id"]] = TemplateMatcher(vectors, threshold=float(td.get("threshold", 8.0)))
+            if len(vectors) < 2:
+                continue
+            ok, why = template_compatible(td, space, engine_mode)
+            if not ok:
+                skipped.append((a.get("name") or a.get("id"), why))
+                continue
+            try:
+                th = float(td.get("threshold") or 0) or None
+                seq[a["id"]] = TemplateMatcher(vectors, threshold=th, space=space)
+            except ValueError as e:
+                skipped.append((a.get("name") or a.get("id"), str(e)))
         else:
             rule.append(a)
+    if skipped:
+        print(f"  [模板跳过] 以下序列模板在当前环境下不可用"
+              f"（特征空间 FEATURE_SPACE={space}，推理模式 {engine_mode}），"
+              f"需重新录制：")
+        for name, why in skipped:
+            print(f"    - {name}（{why}）")
     return rule, seq
 
 
@@ -51,7 +99,9 @@ class MonitorSession:
             for a in actions if a.get("template_type") != "sequence"
         }
         self.action_map = {a["id"]: a for a in actions}
-        self.rule_actions, self.seq_matchers = _build_matchers(actions)
+        self.space = getattr(config, "FEATURE_SPACE", "2d")
+        self.rule_actions, self.seq_matchers = _build_matchers(actions, self.space)
+        _warn_unknown_joints(self.rule_actions)
         self.step_actions = [s.get("action_id") for s in process.get("steps", [])]
         self.steps = process.get("steps", [])
         if assess:
@@ -65,6 +115,11 @@ class MonitorSession:
         self._jpeg = None
         self._jpeg_lock = threading.Lock()
         self._jpeg_ts = 0.0
+        # JPEG 编码是整条链路里第二大的开销（实测 720p 约 9.4ms/帧，占 25%）。
+        # 前端是**轮询** /frame 取画面（约 120ms 一次 ≈ 8fps），
+        # 因此按源帧率逐帧编码是纯浪费；更糟的是无人观看时（页面已关、
+        # 或用 monitor.py 跑批）也照样在编。这里改为「有观众 + 限频」才编。
+        self._last_consumer = 0.0
         self._step_order = None
         self._step_since = None
         self._off_since = None
@@ -82,6 +137,20 @@ class MonitorSession:
         }
 
     def start(self):
+        # TODO(时间轴): 本会话的「事件时间轴」目前**一律用墙钟**（_start_wall /
+        # time.time()），包括 _frames["ts"]、停留时长 step_stay、离屏时长 off_screen。
+        #
+        # 对**实时摄像头**这是正确的：帧的到达节奏就等于真实时间。
+        # 但对**视频文件**是错的：文件按 CPU 速度解码，处理多快就吞多少素材，
+        # 实测同一段 720p 素材 5s 墙钟覆盖 8.88s 视频（VIDEO 模式）/ 4.20s（IMAGE），
+        # 偏差 111%（数据见 video_source.use_video_clock）。后果是拿视频文件做
+        # 评估时，step_stay / off_screen 以及 threshold 里的时长门槛会按约 1.8×
+        # 的比例失真，且随机器快慢变化——与录制/标定侧已经改成视频时间轴不一致。
+        #
+        # 已与需求方确认「先标注不改」：改它会动到评分口径，需单独评审。
+        # 录制/标定侧的同类问题已修（record_template / calibrate_template /
+        # calibrate_rule 走 video_source.use_video_clock）。此处改动前请先更新
+        # tests/test_engine_runtime.py::test_assessment_timeline_is_deliberately_wall_clock。
         self._start_wall = time.time()
         self._load_thresholds()
         self._running = True
@@ -180,6 +249,8 @@ class MonitorSession:
         return self._error
 
     def get_jpeg(self):
+        """取最新画面。调用即视为「有观众」，用于决定是否继续编码。"""
+        self._last_consumer = time.time()
         with self._jpeg_lock:
             return self._jpeg, self._jpeg_ts
 
@@ -192,6 +263,20 @@ class MonitorSession:
             self._state.update(kw)
 
     def _publish_jpeg(self, frame):
+        """编码并发布最新画面；无人观看或未到预览帧率时直接跳过。
+
+        跳过是有意为之：识别结果不受影响（识别用的是原始帧），
+        只是画面刷新率降低。相比每帧都编码，可省下约 25% 的单帧开销。
+        """
+        now = time.time()
+        # 无人观看（页面已关 / headless 跑批）→ 不编码。
+        # 例外：一帧都还没有时先编一帧，保证前端首次轮询就能拿到画面。
+        if self._jpeg is not None and (now - self._last_consumer) > config.PREVIEW_IDLE_SEC:
+            return
+        # 限频：预览不需要跟满源帧率
+        min_interval = 1.0 / max(1.0, config.PREVIEW_FPS)
+        if (now - self._jpeg_ts) < min_interval:
+            return
         try:
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
@@ -217,14 +302,16 @@ class MonitorSession:
             self._error = "未安装 opencv，无法启动监控"
             self._running = False
             return
-        engine = PoseEngine()
         recognizer = ActionRecognizer()
         cap = VideoSource(self.source)
         if not cap.open():
             self._error = f"无法打开视频源: {self.source}"
             self._running = False
-            engine.close()
             return
+        # 用视频源的真实帧率初始化：VIDEO 模式据此生成时间戳，
+        # 使帧间平滑的时间尺度与实际播放一致。
+        # 引擎不可用时 detect() 会返回未检出，循环照常推流画面（视觉是软依赖）。
+        engine = PoseEngine(fps=cap.fps)
 
         detected_seq = []
         last_active = set()
@@ -234,20 +321,32 @@ class MonitorSession:
         while self._running:
             ok, frame = cap.read()
             if not ok:
+                if cap.eof:
+                    # 视频文件播完：会话正常结束（否则会一直空转到进程被强杀）
+                    break
                 time.sleep(0.05)
                 continue
             if str(self.source).isdigit():
                 frame = cv2.flip(frame, 1)
 
-            ok_pose, pts = engine.landmarks_from_frame(frame)
+            ok_pose, pts, pts3d = engine.detect(frame)
             active = []
             if ok_pose:
-                features = PoseEngine.compute_features(pts)
+                # 规则型动作的条件写在**二维特征名**上（trunk_inclination、
+                # left_knee_angle…），而三维特征的键名不同（l_knee_angle…）。
+                # 因此规则判定一律用二维特征，与 FEATURE_SPACE 无关；
+                # 否则切到 3d 空间会让所有规则型动作静默失效。
+                feats2d = PoseEngine.compute_features(pts)
+                use3d = self.space == "3d" and bool(pts3d)
+                features = PoseEngine.compute_features_3d(pts3d) if use3d else feats2d
                 if self.assess:
+                    # TODO(时间轴): 见 start() 的说明——文件源下墙钟会按机器快慢
+                    # 失真约 1.8×，此处应先确认为何「先标注不改」再动。
                     self._frames["ts"].append(round(time.time() - self._start_wall, 3))
-                    self._frames["feats"].append(features_to_vector(features).tolist())
-                active = recognizer.update(features, self.rule_actions)
-                vec = features_to_vector(features)
+                    self._frames["feats"].append(
+                        features_to_vector(features, self.space).tolist())
+                active = recognizer.update(feats2d, self.rule_actions)
+                vec = features_to_vector(features, self.space)
                 for aid, m in self.seq_matchers.items():
                     dist, hit = m.update(vec)
                     if hit:
@@ -294,6 +393,7 @@ class MonitorSession:
             )
 
             # 停留时长 / 离屏时长 / 预警级别（供教师看板使用）
+            # TODO(时间轴): 同 start() 的说明——文件源下这两项按墙钟计会失真约 1.8×。
             now_ts = time.time()
             if result["current_step"] != self._step_order:
                 self._step_order = result["current_step"]
