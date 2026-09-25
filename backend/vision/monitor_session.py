@@ -85,10 +85,20 @@ def _build_matchers(actions, space, engine_mode=DEFAULT_RUNNING_MODE):
             rule.append(a)
     if skipped:
         print(f"  [模板跳过] 以下序列模板在当前环境下不可用"
-              f"（特征空间 FEATURE_SPACE={space}，推理模式 {engine_mode}），"
-              f"需重新录制：")
+              f"（特征空间 FEATURE_SPACE={space}，推理模式 {engine_mode}）：")
         for name, why in skipped:
             print(f"    - {name}（{why}）")
+        # 最常见的两种情况给出**具体动作**，而不是笼统一句"需重新录制"——
+        # 用户刚按 3d 录完模板、平台却仍以 2d 默认启动时，其实不需要重录。
+        if any(w.startswith("模板为 ") and w.endswith("空间") for _n, w in skipped):
+            other = "2d" if space == "3d" else "3d"
+            print(f"    这些模板是用 {other} 空间录的，**不用重录**："
+                  f"用 FEATURE_SPACE={other} 重启即可（或改 config.FEATURE_SPACE）")
+        if any("版本" in w for _n, w in skipped):
+            print("    版本不符说明特征定义已变，这类必须重录。")
+        if any("IMAGE" in w for _n, w in skipped):
+            print("    建议改用 VIDEO 模式重录：IMAGE 模板可能含失稳向量，"
+                  "会永久拉偏 DTW。")
     return rule, seq
 
 

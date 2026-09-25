@@ -127,10 +127,19 @@ def build_matchers(actions, space):
         else:
             rule_actions.append(a)
     if skipped:
-        print(f"  [模板跳过] 当前特征空间 FEATURE_SPACE={space}，以下序列模板不可用，"
-              f"需用同一版本重新录制：")
+        print(f"  [模板跳过] 当前特征空间 FEATURE_SPACE={space}，"
+              f"以下序列模板在本环境下不可用：")
         for name, why in skipped:
             print(f"    - {name}（{why}）")
+        # 给出**具体动作**而不是笼统一句"需重新录制"：用户刚按 3d 录完模板、
+        # 命令却仍以 2d 默认运行时，其实不需要重录。
+        if any(w.startswith("模板为 ") and w.endswith("空间") for _n, w in skipped):
+            other = "2d" if space == "3d" else "3d"
+            print(f"    这些模板是用 {other} 空间录的，**不用重录**："
+                  f"改用 FEATURE_SPACE={other} 运行即可，"
+                  f"或命令行 --space {other}")
+        if any("版本" in w for _n, w in skipped):
+            print("    版本不符说明特征定义已变，这类必须重录。")
     valid = set(PoseEngine.compute_features([(0.5, 0.5, 1.0)] * 33).keys())
     bad = [(a.get("name") or a.get("id"), unknown_joints(a.get("conditions"), valid))
            for a in rule_actions]
