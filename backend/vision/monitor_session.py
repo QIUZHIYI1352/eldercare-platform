@@ -16,6 +16,7 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None
 
+from backend.vision.video_source import VideoSource
 from backend.vision.pose_engine import PoseEngine, DEFAULT_RUNNING_MODE
 from backend.vision.action_recognizer import ActionRecognizer, unknown_joints
 from backend.vision.sequence_matcher import match_sequence

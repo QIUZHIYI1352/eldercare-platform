@@ -312,3 +312,31 @@ def test_assessment_timeline_is_deliberately_wall_clock():
         "评估/离屏时长的墙钟基准变了；若是有意改成视频时间轴，"
         "请一并更新本测试与相关阈值说明"
     )
+
+
+# ------------------------------------- 运行期：会话启动路径必须真的能跑起来
+
+def test_session_startup_reaches_source_open(tmp_path):
+    """「开始监控」的启动路径必须真的走到「打开视频源」，而不是崩在更早一步。
+
+    回归：`_run_impl` 里调用 `VideoSource(...)` 却没 import，用户点开始监控
+    只看到一句「识别出错：name 'VideoSource' is not defined」。
+    之所以能躲过整套测试：这段代码跑在后台线程里，异常被 `_run()` 的兜底 except
+    写进 `state["error"]`，HTTP 层照样 200。所以这里**同步**调用 `_run_impl`，
+    把错误直接断言出来。
+
+    源用 tmp_path 下一个不存在的文件：既走完「构造视频源 → 打开」这两行，
+    又不需要真的解码和推理（也就不会受机器快慢影响）。
+    """
+    pytest.importorskip("cv2")  # 没装 opencv 时本函数会提前 return，测不到那两行
+    from backend.vision import monitor_session as ms
+
+    sess = ms.MonitorSession(str(tmp_path / "not_a_real_video.mp4"),
+                             {"id": "proc_x", "name": "回归用流程", "steps": []},
+                             [], "u_regression", "", False)
+    sess._run_impl()
+    err = sess._error or ""
+    assert "无法打开视频源" in err, (
+        f"启动路径没能走到「打开视频源」这一步就失败了：{err!r}。"
+        f"若报 NameError/AttributeError，说明有名字没绑定或接口对不上"
+    )
