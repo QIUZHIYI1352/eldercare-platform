@@ -180,3 +180,66 @@ def test_template_matcher_min_ratio_gate():
     for i in range(max(1, int(len(motion) * 0.6)) - 1):
         dist, hit = m.update(motion[i], now_ts=100 + i)
         assert dist == float("inf") and hit is False
+
+
+# ---------- 短暂中断不该清零计时（治规则型漏报） ----------
+
+def _tpl(duration=1.0):
+    return [{"id": "a1", "conditions": [{"joint": "trunk", "op": ">=", "value": 30}],
+             "duration": duration}]
+
+
+def test_brief_gap_does_not_reset_the_hold_timer():
+    """满足 0.8s → 抖一帧 → 满足：总时长到 1.0s 就该达成。
+
+    原实现（严格连续）会在这里归零，要再等满 1 秒——真人动作帧帧卡在阈值
+    同一侧几乎不可能，这是规则型漏报的主要来源。
+    """
+    tpl = _tpl(1.0)
+    rec = ActionRecognizer(gap_tol=0.4)
+    assert rec.update({"trunk": 45}, tpl, now_ts=0.0) == []
+    assert rec.update({"trunk": 45}, tpl, now_ts=0.8) == []
+    assert rec.update({"trunk": 0}, tpl, now_ts=0.84) == []      # 抖了一帧
+    assert rec.update({"trunk": 45}, tpl, now_ts=1.0) == ["a1"], (
+        "短暂中断把计时清零了，这就是漏报")
+    # 对照：容差设为 0 时必须回到严格连续的老行为
+    strict = ActionRecognizer(gap_tol=0.0)
+    strict.update({"trunk": 45}, tpl, now_ts=0.0)
+    strict.update({"trunk": 45}, tpl, now_ts=0.8)
+    strict.update({"trunk": 0}, tpl, now_ts=0.84)
+    assert strict.update({"trunk": 45}, tpl, now_ts=1.0) == []
+    assert strict.update({"trunk": 45}, tpl, now_ts=2.0) == ["a1"], (
+        "严格模式（gap_tol=0）应当在重新计时满 1.0s 后（t=2.0）才达成")
+
+
+def test_gap_frame_itself_is_never_active():
+    """中断那一帧本身绝不算激活，否则会凭空报出动作（误报）。"""
+    tpl = _tpl(0.5)
+    rec = ActionRecognizer(gap_tol=0.4)
+    assert rec.update({"trunk": 45}, tpl, now_ts=0.0) == []
+    assert rec.update({"trunk": 45}, tpl, now_ts=0.6) == ["a1"]
+    assert rec.update({"trunk": 0}, tpl, now_ts=0.7) == [], "中断帧被判成激活了"
+
+
+def test_stuttering_does_not_accumulate_into_a_false_hit():
+    """断续地凑时长不能算达成——容差是给"抖动"的，不是给"没做"的。
+
+    每 0.5s 满足一次、间隔 0.5s：每次间隔都超过 0.4s 的容差，必须一直重新计时。
+    """
+    tpl = _tpl(1.0)
+    rec = ActionRecognizer(gap_tol=0.4)
+    hits = []
+    for i in range(12):
+        ok = (i % 2 == 0)
+        hits += rec.update({"trunk": 45 if ok else 0}, tpl, now_ts=i * 0.5)
+    assert hits == [], f"断续动作被凑成了达成：{hits}"
+
+
+def test_long_gap_still_resets():
+    """真中断（超过容差）照旧重新计时。"""
+    tpl = _tpl(0.5)
+    rec = ActionRecognizer(gap_tol=0.4)
+    rec.update({"trunk": 45}, tpl, now_ts=0.0)
+    rec.update({"trunk": 0}, tpl, now_ts=1.0)      # 中断 1 秒
+    assert rec.update({"trunk": 45}, tpl, now_ts=2.0) == []
+    assert rec.update({"trunk": 45}, tpl, now_ts=2.6) == ["a1"]

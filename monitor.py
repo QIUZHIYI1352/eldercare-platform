@@ -31,6 +31,8 @@ from backend.vision.sequence_matcher import match_sequence
 from backend.vision.template_matcher import (TemplateMatcher, features_to_vector,
                                             template_compatible)
 from backend.vision.video_source import VideoSource
+from backend.vision import frame_norm
+from backend.vision import feature_guard
 
 try:
     import cv2
@@ -176,11 +178,14 @@ def main():
         return
     # 用源的真实帧率初始化（VIDEO 模式据此生成帧间时间戳）
     engine = PoseEngine(fps=cap.fps)
+    # 失稳帧门控：单帧变化量上限要用 dt 换算，因此按源的真实帧率建
+    guard = feature_guard.FeatureGuard(fps=cap.fps)
 
     detected_seq = []       # 已识别动作 id 序列（按时间）
     last_active = set()
     active_since = {}
     seq_status = {}         # 序列动作最近一次匹配距离（用于画面显示）
+    frame_plan = None       # 宽高比方案：要等第一帧才知道源的真实比例
 
     while True:
         ok, frame = cap.read()
@@ -192,21 +197,42 @@ def main():
             # 断流重连中，短暂等待
             time.sleep(0.05)
             continue
+        if frame_plan is None:
+            h, w = frame.shape[:2]
+            tpls = [(aid, action_map[aid].get("name") or aid,
+                     (action_map[aid].get("template_data") or {}).get("frame_aspect"))
+                    for aid in seq_matchers]
+            frame_plan, dropped = frame_norm.select(space, (w, h), tpls)
+            for aid, _n, _r in dropped:
+                seq_matchers.pop(aid, None)
+            frame_norm.describe(frame_plan, dropped)
+        # 必须在 detect 之前补边：归一化坐标以整幅画布为分母
+        frame = frame_plan.apply(frame)
         if source.isdigit():
             frame = cv2.flip(frame, 1)
 
         ok_pose, pts, pts3d = engine.detect(frame)
         active = []          # 当前激活的 rule 动作 id
+        gate_ok = True
         if ok_pose:
             # 规则条件写在**二维特征名**上（trunk_inclination、left_knee_angle…），
             # 三维特征键名不同（l_knee_angle…）。故规则判定固定用二维特征，
             # 与 FEATURE_SPACE 无关，否则切到 3d 空间会让规则型动作静默失效。
             feats2d = PoseEngine.compute_features(pts)
+            gate_ok, why, bad = guard.check(feats2d, time.time())
+            if not gate_ok:
+                # 坏值用线性预测替代（不丢帧）：丢帧会让 DTW 滑窗少几帧，
+                # 等于拿残缺动作去比对，实测会把命中变成未命中。
+                feats2d = guard.repair(feats2d, bad)
+                if guard.gated == 1 or guard.gated % 100 == 0:
+                    print(f"  [失稳帧] 已修复 {guard.gated} 帧：{why}")
+        if ok_pose:
             features = (PoseEngine.compute_features_3d(pts3d)
                         if space == "3d" and pts3d else feats2d)
-            # 1) 规则型动作
-            active = recognizer.update(feats2d, rule_actions)
-            # 2) 序列型动作（DTW）
+            # 1) 规则型动作：失稳帧跳过（瞬时阈值 + 外推值可能凭空造出动作）
+            if gate_ok:
+                active = recognizer.update(feats2d, rule_actions)
+            # 2) 序列型动作（DTW）：失稳帧也用修复后的特征，保持序列连续
             vec = features_to_vector(features, space)
             for aid, matcher in seq_matchers.items():
                 dist, hit = matcher.update(vec)

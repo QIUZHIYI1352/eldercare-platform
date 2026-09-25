@@ -22,6 +22,8 @@ from backend.vision.action_recognizer import ActionRecognizer, unknown_joints
 from backend.vision.sequence_matcher import match_sequence
 from backend.vision.template_matcher import (TemplateMatcher, features_to_vector,
                                             template_compatible)
+from backend.vision import frame_norm
+from backend.vision import feature_guard as guard_mod
 
 
 def _warn_unknown_joints(rule_actions):
@@ -126,6 +128,8 @@ class MonitorSession:
         self._off_since = None
         self.thresholds = {"step_warn": 30, "step_crit": 60, "off": 5}
         self._state = self._empty_state()
+        # 失稳帧门控，_run_impl 里按源的真实帧率创建
+        self._guard = None
 
     def _empty_state(self):
         return {
@@ -135,6 +139,9 @@ class MonitorSession:
                       for s in self.steps],
             "detected_actions": [], "active_actions": [], "record_id": None,
             "step_stay": 0, "off_screen": 0, "alert_level": "ok",
+            # 宽高比归一化用了什么比例；跳过/失稳计数必须外显，
+            # 这些"被丢弃的帧和模板"一旦不可见，就等于静默失效。
+            "aspect": None, "aspect_skipped": [], "unstable_frames": 0,
         }
 
     def start(self):
@@ -298,6 +305,51 @@ class MonitorSession:
             self._set_state(running=False, error=str(e))
             self._running = False
 
+    def _init_aspect_plan(self, frame):
+        """按第一帧的尺寸定下宽高比方案，并剔除比例不符的序列模板。
+
+        为什么等第一帧：源的真实比例只有拿到画面才知道——手机串流/网络摄像头
+        会协商出与预期不同的分辨率（免费版 DroidCam 就是 4:3）。
+
+        为什么比例不符的模板要**剔除**而不是"照样匹配"：2d 特征的偏移是
+        **系统性**的，不是噪声。实测同一姿态 16:9 量到躯干角 6.8°、竖屏量到
+        20.7°，膝关节角 171° → 154°——等于把站立判成屈膝。留着它只会产出误报。
+        剔除后必须打印它剔了谁，否则就成了静默失效。
+        """
+        h, w = frame.shape[:2]
+        tpls = []
+        for aid in self.seq_matchers:
+            a = self.action_map.get(aid) or {}
+            tpls.append((aid, a.get("name") or aid,
+                         (a.get("template_data") or {}).get("frame_aspect")))
+        plan, dropped = frame_norm.select(self.space, (w, h), tpls)
+        for aid, _name, _r in dropped:
+            self.seq_matchers.pop(aid, None)
+
+        frame_norm.describe(plan, dropped)
+        self._set_state(aspect=plan.note,
+                        aspect_skipped=[n for _k, n, _r in dropped])
+        return plan
+
+    def _note_unstable(self, why, bad):
+        """失稳帧必须可见：静默修复和静默失败一样难查。
+
+        注意这里的语义是**修复**而不是丢弃：坏值会被线性预测替代后继续参与
+        序列匹配（丢帧会把 DTW 命中变成未命中，见 feature_guard.repair）。
+        只有规则型判定会跳过这一帧。
+
+        只在第一帧和每 100 帧打印一次。帧级日志在 30fps 下几分钟就是几万行，
+        真出问题时反而没人看——而这几行恰恰是排查"时好时坏"的入口。
+        """
+        n = self._guard.gated
+        if n == 1 or n % 100 == 0:
+            print(f"  [失稳帧] 第 {n} 帧测量崩坏，已按预测值修复：{why}")
+            if self._guard.resyncs:
+                print(f"    已重同步 {self._guard.resyncs} 次")
+        self._set_state(unstable_frames=n,
+                        unstable_note=self._guard.summary(),
+                        unstable_first=self._guard.first_bad)
+
     def _run_impl(self):
         if cv2 is None:
             self._error = "未安装 opencv，无法启动监控"
@@ -313,11 +365,15 @@ class MonitorSession:
         # 使帧间平滑的时间尺度与实际播放一致。
         # 引擎不可用时 detect() 会返回未检出，循环照常推流画面（视觉是软依赖）。
         engine = PoseEngine(fps=cap.fps)
+        # 门控按源的真实帧率建：单帧变化量上限要用 dt 换算，
+        # 而手机串流实测能从 30fps 掉到 3fps。
+        self._guard = guard_mod.FeatureGuard(fps=cap.fps)
 
         detected_seq = []
         last_active = set()
         active_since = {}
         recent_names = []
+        plan = None      # 宽高比方案：拿到第一帧（知道画面尺寸）之后才能定
 
         while self._running:
             ok, frame = cap.read()
@@ -327,17 +383,31 @@ class MonitorSession:
                     break
                 time.sleep(0.05)
                 continue
+            if plan is None:
+                plan = self._init_aspect_plan(frame)
+            # 必须在 detect 之前补边：mediapipe 的归一化坐标以整幅画布为分母，
+            # 补边之后 x/W、y/H 才与录模板时同尺度。
+            frame = plan.apply(frame)
             if str(self.source).isdigit():
                 frame = cv2.flip(frame, 1)
 
             ok_pose, pts, pts3d = engine.detect(frame)
             active = []
+            gate_ok = True
             if ok_pose:
                 # 规则型动作的条件写在**二维特征名**上（trunk_inclination、
                 # left_knee_angle…），而三维特征的键名不同（l_knee_angle…）。
                 # 因此规则判定一律用二维特征，与 FEATURE_SPACE 无关；
                 # 否则切到 3d 空间会让所有规则型动作静默失效。
                 feats2d = PoseEngine.compute_features(pts)
+                gate_ok, why, bad = self._guard.check(feats2d, time.time())
+                if not gate_ok:
+                    # 序列匹配要的是"时间上连续、采样完整"，丢帧会把命中变成
+                    # 未命中（实测：坏 3 帧时距离 5.3→16.6，直接不命中）。
+                    # 所以坏值用线性预测替代，而不是把这一帧抽掉。
+                    feats2d = self._guard.repair(feats2d, bad)
+                    self._note_unstable(why, bad)
+            if ok_pose:
                 use3d = self.space == "3d" and bool(pts3d)
                 features = PoseEngine.compute_features_3d(pts3d) if use3d else feats2d
                 if self.assess:
@@ -346,7 +416,11 @@ class MonitorSession:
                     self._frames["ts"].append(round(time.time() - self._start_wall, 3))
                     self._frames["feats"].append(
                         features_to_vector(features, self.space).tolist())
-                active = recognizer.update(feats2d, self.rule_actions)
+                if gate_ok:
+                    # 规则型另作处理：条件是**瞬时阈值**，拿外推值去凑可能凭空
+                    # 报出一个动作（误报）。所以失稳帧干脆不参与规则判定——
+                    # 漏掉一帧的代价被"中断容差"吸收，见 action_recognizer。
+                    active = recognizer.update(feats2d, self.rule_actions)
                 vec = features_to_vector(features, self.space)
                 for aid, m in self.seq_matchers.items():
                     dist, hit = m.update(vec)
@@ -401,6 +475,8 @@ class MonitorSession:
                 self._step_since = now_ts
             stay = int(now_ts - (self._step_since or now_ts))
             if ok_pose:
+                # 检出人就算在画面内。个别关节的测量崩坏不影响"人在不在"这个判断，
+                # 因此失稳帧同样可以清掉离屏计时。
                 self._off_since = None
             elif self._off_since is None:
                 self._off_since = now_ts

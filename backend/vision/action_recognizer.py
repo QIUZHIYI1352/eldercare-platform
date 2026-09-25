@@ -9,6 +9,11 @@ duration 为需持续满足的秒数。
 """
 import time
 
+import config
+
+# 「持续满足时长」判定的中断容差（秒）。见 ActionRecognizer 的说明。
+GAP_TOL = float(getattr(config, "HOLD_GAP_TOL", 0.4))
+
 OPS = {
     ">": lambda a, b: a > b,
     ">=": lambda a, b: a >= b,
@@ -49,11 +54,26 @@ def evaluate_conditions(features, conditions):
 
 
 class ActionRecognizer:
-    """对连续帧特征做动作判定，维护「持续满足时长」避免单帧抖动误判。"""
+    """对连续帧特征做动作判定，维护「持续满足时长」避免单帧抖动误判。
 
-    def __init__(self):
-        # action_id -> {hold_start: float, active: bool}
+    ## 短暂中断不清零（治漏报）
+
+    原实现是**严格连续**：只要有一帧不满足就把 `hold_start` 归零、从头计时。
+    真人动作很难帧帧都卡在阈值同一侧——关键点抖一下、手抬过临界值再回来，
+    计数器就前功尽弃。实测这是规则型动作漏报的主要来源。
+
+    现在允许 `GAP_TOL` 秒以内的中断**保留计时**：中断帧本身照旧不算激活
+    （不会因此产生误报），但恢复后接着上次的进度继续累计。
+    超过 `GAP_TOL` 才算真正中断，重新计时。
+
+    这个值是有意做得保守的（默认 0.4s）：它换来的是"容忍抖动"，
+    放宽过头会让"断续地凑够时长"也算达成 —— 那是误报。
+    """
+
+    def __init__(self, gap_tol=None):
+        # action_id -> {hold_start: float, gap_start: float, active: bool}
         self._state = {}
+        self.gap_tol = GAP_TOL if gap_tol is None else float(gap_tol)
 
     def reset(self):
         self._state = {}
@@ -70,13 +90,20 @@ class ActionRecognizer:
             conditions = tpl.get("conditions") or []
             duration = float(tpl.get("duration") or 0.5)
             satisfied = evaluate_conditions(features, conditions)
-            st = self._state.setdefault(aid, {"hold_start": None, "active": False})
+            st = self._state.setdefault(
+                aid, {"hold_start": None, "gap_start": None, "active": False})
             if satisfied:
-                if st["hold_start"] is None:
+                interrupted = (st["gap_start"] is not None
+                               and (now_ts - st["gap_start"]) > self.gap_tol)
+                if interrupted or st["hold_start"] is None:
                     st["hold_start"] = now_ts
+                st["gap_start"] = None
                 st["active"] = (now_ts - st["hold_start"]) >= duration
             else:
-                st["hold_start"] = None
+                # 中断帧本身一律不算激活（否则会凭空报出动作），
+                # 但只有超过容差才作废已累计的时长。
+                if st["gap_start"] is None:
+                    st["gap_start"] = now_ts
                 st["active"] = False
             if st["active"]:
                 active.append(aid)
