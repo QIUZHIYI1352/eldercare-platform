@@ -29,10 +29,11 @@ from backend.vision.pose_engine import PoseEngine, DEFAULT_RUNNING_MODE
 from backend.vision.action_recognizer import ActionRecognizer, unknown_joints
 from backend.vision.sequence_matcher import match_sequence
 from backend.vision.template_matcher import (TemplateMatcher, features_to_vector,
-                                            template_compatible)
+                                            missing_keys, template_compatible)
 from backend.vision.video_source import VideoSource
 from backend.vision import frame_norm
 from backend.vision import feature_guard
+from backend.vision import obs_guard
 
 try:
     import cv2
@@ -186,6 +187,15 @@ def main():
     active_since = {}
     seq_status = {}         # 序列动作最近一次匹配距离（用于画面显示）
     frame_plan = None       # 宽高比方案：要等第一帧才知道源的真实比例
+    # 观测门控：直接从即将参与匹配的 matcher 上取判别维度（不重读模板数据，
+    # 避免两处分叉）。手持跟拍下"识别不到"常因画面没拍全，必须说出来。
+    obs_gates = obs_guard.build_gates(
+        seq_matchers, {a["id"]: (a.get("name") or a["id"]) for a in actions})
+    for g in obs_gates.values():
+        print(f"  [观测门控] {g.describe()}")
+    no_world = 0            # 三维空间拿不到世界关键点的帧数
+    missing_warned = [False]
+    skipped_logged = set()  # 已提示过"画面没拍全"的动作
 
     while True:
         ok, frame = cap.read()
@@ -205,6 +215,7 @@ def main():
             frame_plan, dropped = frame_norm.select(space, (w, h), tpls)
             for aid, _n, _r in dropped:
                 seq_matchers.pop(aid, None)
+                obs_gates.pop(aid, None)   # 模板被剔除，门控同步移除
             frame_norm.describe(frame_plan, dropped)
         # 必须在 detect 之前补边：归一化坐标以整幅画布为分母
         frame = frame_plan.apply(frame)
@@ -214,11 +225,13 @@ def main():
         ok_pose, pts, pts3d = engine.detect(frame)
         active = []          # 当前激活的 rule 动作 id
         gate_ok = True
+        vis = {}
         if ok_pose:
             # 规则条件写在**二维特征名**上（trunk_inclination、left_knee_angle…），
             # 三维特征键名不同（l_knee_angle…）。故规则判定固定用二维特征，
             # 与 FEATURE_SPACE 无关，否则切到 3d 空间会让规则型动作静默失效。
             feats2d = PoseEngine.compute_features(pts)
+            vis = obs_guard.visibility_map(pts)
             gate_ok, why, bad = guard.check(feats2d, time.time())
             if not gate_ok:
                 # 坏值用线性预测替代（不丢帧）：丢帧会让 DTW 滑窗少几帧，
@@ -227,19 +240,49 @@ def main():
                 if guard.gated == 1 or guard.gated % 100 == 0:
                     print(f"  [失稳帧] 已修复 {guard.gated} 帧：{why}")
         if ok_pose:
-            features = (PoseEngine.compute_features_3d(pts3d)
-                        if space == "3d" and pts3d else feats2d)
+            # 三维空间没拿到世界关键点时**跳过**序列匹配，而不是回落去喂二维特征
+            # ——两个空间的 18 个维度只有 hands_distance 同名，其余 17 个键全部缺失，
+            # features_to_vector 补 0.0，经 Z-score 归一化后是个"看起来很正常的
+            # 向量"：实测全为 0，不报错、不命中、也不进任何日志，是纯粹静默的漏报。
+            space_ok = (bool(pts3d) if space == "3d" else True)
+            features = (PoseEngine.compute_features_3d(pts3d) if space_ok
+                        and space == "3d" else feats2d)
+            if not space_ok:
+                no_world += 1
+                if no_world == 1 or no_world % 300 == 0:
+                    print(f"  [三维缺帧] 第 {no_world} 帧没有世界关键点，跳过序列匹配")
             # 1) 规则型动作：失稳帧跳过（瞬时阈值 + 外推值可能凭空造出动作）
             if gate_ok:
                 active = recognizer.update(feats2d, rule_actions)
             # 2) 序列型动作（DTW）：失稳帧也用修复后的特征，保持序列连续
-            vec = features_to_vector(features, space)
-            for aid, matcher in seq_matchers.items():
-                dist, hit = matcher.update(vec)
-                seq_status[aid] = dist
-                if hit:
-                    detected_seq.append(aid)
-                    print(f"  ✓ [序列] 识别到动作: {action_map[aid]['name']} (DTW={dist:.1f})")
+            if space_ok:
+                miss = missing_keys(features, space)
+                if miss:
+                    if not missing_warned[0]:
+                        missing_warned[0] = True
+                        print(f"  [特征缺失] 当前空间缺少 {len(miss)} 个字段"
+                              f"（{', '.join(miss[:6])}），序列匹配被跳过")
+                else:
+                    vec = features_to_vector(features, space)
+                    for aid, matcher in seq_matchers.items():
+                        # 观测门控：该动作真正依赖的部位没拍全时不参与匹配。
+                        # mediapipe 对画面外的关节只打低 visibility 并**推测**一个
+                        # 位置，拿推测出来的膝角去判「屈膝下蹲」就是误报。
+                        gate = obs_gates.get(aid)
+                        if gate is not None:
+                            obs_ok, low = gate.check(pts, vis)
+                            if not obs_ok:
+                                if aid not in skipped_logged:
+                                    skipped_logged.add(aid)
+                                    print(f"  [观测门控] 看不清 {'、'.join(low)}，"
+                                          f"「{action_map[aid]['name']}」暂不参与判定")
+                                continue
+                        dist, hit = matcher.update(vec)
+                        seq_status[aid] = dist
+                        if hit:
+                            detected_seq.append(aid)
+                            print(f"  ✓ [序列] 识别到动作: "
+                                  f"{action_map[aid]['name']} (DTW={dist:.1f})")
 
         # 规则动作：进入->离开 记一次完成
         active_set = set(active)

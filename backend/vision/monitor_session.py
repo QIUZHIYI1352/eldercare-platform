@@ -21,9 +21,10 @@ from backend.vision.pose_engine import PoseEngine, DEFAULT_RUNNING_MODE
 from backend.vision.action_recognizer import ActionRecognizer, unknown_joints
 from backend.vision.sequence_matcher import match_sequence
 from backend.vision.template_matcher import (TemplateMatcher, features_to_vector,
-                                            template_compatible)
+                                            missing_keys, template_compatible)
 from backend.vision import frame_norm
 from backend.vision import feature_guard as guard_mod
+from backend.vision import obs_guard
 
 
 def _warn_unknown_joints(rule_actions):
@@ -105,6 +106,15 @@ class MonitorSession:
         self.space = getattr(config, "FEATURE_SPACE", "2d")
         self.rule_actions, self.seq_matchers = _build_matchers(actions, self.space)
         _warn_unknown_joints(self.rule_actions)
+        # 观测门控：直接从即将参与匹配的 matcher 上取判别维度，不重读一遍模板数据
+        # （两处各读一遍迟早分叉，后果是"命令行能识别、平台里识别不出"）。
+        _names = {a["id"]: (a.get("name") or a["id"]) for a in actions}
+        self.obs_gates = obs_guard.build_gates(self.seq_matchers, _names)
+        if self.obs_gates:
+            print(f"  [观测门控] 已为 {len(self.obs_gates)} 个序列模板建立"
+                  f"（可见度下限 {obs_guard.VIS_LIMIT}）")
+            for g in self.obs_gates.values():
+                print(f"    - {g.describe()}")
         self.step_actions = [s.get("action_id") for s in process.get("steps", [])]
         self.steps = process.get("steps", [])
         if assess:
@@ -142,6 +152,10 @@ class MonitorSession:
             # 宽高比归一化用了什么比例；跳过/失稳计数必须外显，
             # 这些"被丢弃的帧和模板"一旦不可见，就等于静默失效。
             "aspect": None, "aspect_skipped": [], "unstable_frames": 0,
+            # 观测门控与三维缺帧同样必须外显：手持跟拍下"识别不到"的真实原因
+            # 往往是"画面没拍全"，不报出来就会被当成算法问题反复调阈值。
+            "obs_note": None, "obs_skipped": [], "obs_frames": 0,
+            "no_world_frames": 0, "missing_features": [],
         }
 
     def start(self):
@@ -325,6 +339,7 @@ class MonitorSession:
         plan, dropped = frame_norm.select(self.space, (w, h), tpls)
         for aid, _name, _r in dropped:
             self.seq_matchers.pop(aid, None)
+            self.obs_gates.pop(aid, None)   # 模板被剔除，门控同步移除
 
         frame_norm.describe(plan, dropped)
         self._set_state(aspect=plan.note,
@@ -349,6 +364,53 @@ class MonitorSession:
         self._set_state(unstable_frames=n,
                         unstable_note=self._guard.summary(),
                         unstable_first=self._guard.first_bad)
+
+    def _note_no_world(self, now_ts):
+        """三维特征空间下拿不到世界关键点——必须说出来。
+
+        这时候序列匹配整帧都被跳过。若不报，"识别不到"会被误以为是动作没做对，
+        而真实原因是这条源（或这台设备）没给出 pose_world_landmarks。
+        """
+        self._no_world = getattr(self, "_no_world", 0) + 1
+        n = self._no_world
+        if n == 1 or n % 300 == 0:
+            print(f"  [三维缺帧] 第 {n} 帧没有世界关键点（pose_world_landmarks），"
+                  f"该帧不参与序列匹配")
+        self._set_state(no_world_frames=n)
+
+    def _note_missing(self, miss):
+        """该空间的必填特征缺失——同样是静默失效的高发区，报一次就够。"""
+        key = tuple(miss)
+        if getattr(self, "_missing_key", None) != key:
+            self._missing_key = key
+            print(f"  [特征缺失] 当前特征空间缺少 {len(miss)} 个字段"
+                  f"（{', '.join(miss[:6])}{'…' if len(miss) > 6 else ''}），"
+                  f"该帧不参与序列匹配")
+        self._set_state(missing_features=list(miss))
+
+    def _note_obs(self, aid, low):
+        """观测门控拦下的原因必须可见，否则"漏报"永远查不出根因。
+
+        手持跟拍时人常常半身入画，此时正确的行为是**明确说不出话**：
+        告诉使用者"画面里看不到左脚/右脚，暂时判不了这个动作"，
+        而不是拿 mediapipe 推测出来的膝角报一个假动作。
+        """
+        name = (self.action_map.get(aid) or {}).get("name") or aid
+        self._obs_frames = getattr(self, "_obs_frames", 0) + 1
+        n = self._obs_frames
+        seen = getattr(self, "_obs_seen", None)
+        if seen is None:
+            seen = self._obs_seen = set()
+        key = (aid, tuple(low))
+        first = key not in seen
+        seen.add(key)
+        if first or n % 300 == 0:
+            print(f"  [观测门控] 画面里看不清 {'、'.join(low)}，"
+                  f"「{name}」暂不参与判定（累计 {n} 帧）")
+        skipped = sorted({(self.action_map.get(k) or {}).get("name") or k
+                          for k, _l in seen})
+        self._set_state(obs_frames=n, obs_skipped=skipped,
+                        obs_note=f"画面未拍全，暂不判定：{'、'.join(skipped)}")
 
     def _run_impl(self):
         if cv2 is None:
@@ -394,12 +456,14 @@ class MonitorSession:
             ok_pose, pts, pts3d = engine.detect(frame)
             active = []
             gate_ok = True
+            vis = {}
             if ok_pose:
                 # 规则型动作的条件写在**二维特征名**上（trunk_inclination、
                 # left_knee_angle…），而三维特征的键名不同（l_knee_angle…）。
                 # 因此规则判定一律用二维特征，与 FEATURE_SPACE 无关；
                 # 否则切到 3d 空间会让所有规则型动作静默失效。
                 feats2d = PoseEngine.compute_features(pts)
+                vis = obs_guard.visibility_map(pts)
                 gate_ok, why, bad = self._guard.check(feats2d, time.time())
                 if not gate_ok:
                     # 序列匹配要的是"时间上连续、采样完整"，丢帧会把命中变成
@@ -408,9 +472,21 @@ class MonitorSession:
                     feats2d = self._guard.repair(feats2d, bad)
                     self._note_unstable(why, bad)
             if ok_pose:
-                use3d = self.space == "3d" and bool(pts3d)
-                features = PoseEngine.compute_features_3d(pts3d) if use3d else feats2d
-                if self.assess:
+                # 三维空间必须真的拿到世界关键点，否则**跳过**序列匹配。
+                # 曾经的写法是回落去喂二维特征：两个空间的 18 个维度里只有
+                # hands_distance 同名，其余 17 个键全部缺失 → features_to_vector
+                # 补 0.0，模板经 Z-score 归一化后得到一个"看起来很正常的向量"。
+                # 实测该帧向量全为 0，不报错、不命中、也不进任何日志——
+                # 这是纯粹静默的漏报来源。
+                space_ok = True
+                if self.space == "3d":
+                    space_ok = bool(pts3d)
+                    features = PoseEngine.compute_features_3d(pts3d) if space_ok else {}
+                else:
+                    features = feats2d
+                if not space_ok:
+                    self._note_no_world(time.time())
+                if self.assess and space_ok:
                     # TODO(时间轴): 见 start() 的说明——文件源下墙钟会按机器快慢
                     # 失真约 1.8×，此处应先确认为何「先标注不改」再动。
                     self._frames["ts"].append(round(time.time() - self._start_wall, 3))
@@ -421,18 +497,33 @@ class MonitorSession:
                     # 报出一个动作（误报）。所以失稳帧干脆不参与规则判定——
                     # 漏掉一帧的代价被"中断容差"吸收，见 action_recognizer。
                     active = recognizer.update(feats2d, self.rule_actions)
-                vec = features_to_vector(features, self.space)
-                for aid, m in self.seq_matchers.items():
-                    dist, hit = m.update(vec)
-                    if hit:
-                        detected_seq.append(aid)
-                        recent_names.append(self.action_map[aid]["name"])
-                        if self.assess:
-                            idx = self._frame_idx()
-                            start = max(0, idx - m.template_len + 1)
-                            self._events.append(
-                                {"action_id": aid, "start_idx": start, "end_idx": idx})
-                if self.assess:
+                if space_ok:
+                    miss = missing_keys(features, self.space)
+                    if miss:
+                        self._note_missing(miss)
+                    else:
+                        vec = features_to_vector(features, self.space)
+                        for aid, m in self.seq_matchers.items():
+                            # 观测门控：该动作真正依赖的部位没拍全时，这一帧不参与
+                            # 它的匹配。mediapipe 对画面外的关节只打低 visibility
+                            # 并**推测**一个位置，拿推测值去匹配就是误报。
+                            g = self.obs_gates.get(aid)
+                            if g is not None:
+                                obs_ok, low = g.check(pts, vis)
+                                if not obs_ok:
+                                    self._note_obs(aid, low)
+                                    continue
+                            dist, hit = m.update(vec)
+                            if hit:
+                                detected_seq.append(aid)
+                                recent_names.append(self.action_map[aid]["name"])
+                                if self.assess:
+                                    idx = self._frame_idx()
+                                    start = max(0, idx - m.template_len + 1)
+                                    self._events.append(
+                                        {"action_id": aid, "start_idx": start,
+                                         "end_idx": idx})
+                if self.assess and space_ok:
                     self._capture_rule_events(features, active)
 
             active_set = set(active)

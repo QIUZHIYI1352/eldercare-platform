@@ -49,6 +49,13 @@ HOLD_GAP_TOL = float(os.environ.get("HOLD_GAP_TOL", "0.4"))
 # 见 feature_guard.RESYNC_AFTER。它直接决定每次测量崩坏的时间代价：3 帧 ≈ 0.12s。
 GUARD_RESYNC_AFTER = int(os.environ.get("GUARD_RESYNC_AFTER", "3"))
 
+# 观测可用性下限（见 obs_guard）：某个关节的 visibility 低于它就认为「没看清」，
+# 依赖它的那些动作特征不参与判定。手持跟拍时人常常半身入画，而 mediapipe 对
+# 画面外的关节**不会返回空值**、只会把 visibility 打低并推测一个位置——
+# 拿推测出来的膝角去判「屈膝下蹲」就是误报，所以必须按这个值拦住。
+# 调高 = 更保守（更容易报「当前画面看不全」），调低 = 更容易用上边缘观测。
+OBS_VIS_LIMIT = float(os.environ.get("OBS_VIS_LIMIT", "0.5"))
+
 # ---- 实时监控画面（MJPEG/单帧轮询）的推流参数 -------------------------------
 # 画面只用于「让人看见」，不参与识别，所以没必要按源帧率逐帧编码。
 # JPEG 编码在 720p 下约 9ms/帧，是整条识别链路里第二大的开销（占 25%），

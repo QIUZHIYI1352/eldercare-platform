@@ -62,6 +62,32 @@ def features_to_vector(features, space=SPACE_2D):
                     dtype=np.float32)
 
 
+def missing_keys(features, space=SPACE_2D):
+    """返回该空间需要、但特征字典里没有的键（保持 feature_order 的顺序）。
+
+    ## 为什么必须显式检查，不能靠"补 0"兜住
+
+    本函数的调用方过去直接 `features_to_vector`，缺失字段静默补 0.0。而 **0.0 恰好
+    落在一个看起来完全正常的取值范围里**，下游（DTW / 规则）无法区分"这个量没测到"
+    和"这个量真的是 0"。
+
+    实测过一个真实后果：`space="3d"` 但拿不到 `pose_world_landmarks` 时，
+    代码回落去喂二维特征字典——两个空间的 18 个维度里**只有 `hands_distance`
+    同名**，其余 17 个键全部缺失，于是被补成 0.0（整条向量实测全为 0）。
+    模板经过 Z-score 归一化后，全零向量会变成一个"看起来很正常"的向量，
+    匹配既不报错也不命中，只在日志之外静静发生。
+
+    注意那个同名的 `hands_distance` 反而更危险：它是唯一"键存在"因而
+    **不会被本函数发现**的错配维度——它来自二维归一化坐标，与三维的米制距离
+    不是同一个量。所以本函数只挡得住"空间搞错了"的一部分，
+    整类问题仍要靠特征空间的版本戳拦住（见 `template_compatible`）。
+
+    因此调用方应当在拿不到该空间的完整特征时**跳过这一帧并说出来**，
+    而不是让它变成一串 0 混进去。
+    """
+    return [k for k in feature_order(space) if k not in features]
+
+
 def template_compatible(template_data, space, engine_mode=None):
     """判断某条序列模板能否在当前特征空间下使用，返回 (是否可用, 原因)。
 
@@ -202,7 +228,11 @@ class TemplateMatcher:
         self.space = space
         self._mean = raw.mean(axis=0)
         std = raw.std(axis=0)
-        std[std < 1e-6] = 1.0
+        # 真实标准差（未做 1e-6 兜底）：观测可用性判定要用它来判断
+        # 「这个维度在这个动作里到底有没有变化」。归一化用的 std 把零方差维度
+        # 改成了 1.0，那会让"恒定不变"看起来"变化很大"——不能复用。
+        self._std_raw = std.copy()
+        std = np.where(std < 1e-6, 1.0, std)
         self._std = std
         self.template = (raw - self._mean) / self._std
         self.template_len = len(self.template)
