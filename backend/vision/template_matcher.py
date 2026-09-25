@@ -56,10 +56,55 @@ def feature_dim(space=SPACE_2D):
     return len(feature_order(space))
 
 
-def features_to_vector(features, space=SPACE_2D):
-    """特征 dict -> 定长 numpy 向量（缺失字段补 0）。"""
-    return np.array([float(features.get(k, 0.0) or 0.0) for k in feature_order(space)],
-                    dtype=np.float32)
+def features_to_vector(features, space=SPACE_2D, exclude=()):
+    """特征 dict -> 定长 numpy 向量。
+
+    缺失字段补 0；`exclude` 里列出的维度**强制置 0**（模板声明"这个动作不用它"）。
+    """
+    skip = set(exclude or ())
+    return np.array([0.0 if k in skip else float(features.get(k, 0.0) or 0.0)
+                     for k in feature_order(space)], dtype=np.float32)
+
+
+# 依赖踝关节的特征：**脚不在画面里时它们全是编造的**（mediapipe 对画面外的关节
+# 只打低 visibility 并推测一个位置）。实测（几何仿真）：
+#   人在画面里只有腰以上时，站立/下蹲/坐下/转身的三维特征**完全相同**
+#   （trunk_vs_leg 180.00、l_knee_angle 180.00、leg_extend 0.06、ankle_distance 0.56）
+#   —— 这个视角下关于下蹲的信息量为零，不是算法问题。
+#
+# 但"拍到膝盖（大腿入画）"就够了：trunk_vs_leg_angle（大腿相对躯干）不需要踝，
+# 实测对下蹲的响应 29°（180.0 → 154.9 → 150.9），跨机位漂移 0.000°。
+# 于是"不依赖脚"的下蹲判据 = 只用 trunk_vs_leg_angle / l_hip_angle 这类量。
+#
+# **已知代价（实测，必须知道）**：trunk_vs_leg_angle 同时被"躯干前倾"驱动，
+# 所以浅蹲（154.9）与轻弯腰（约 150）会撞车——而「弯腰操作」本来就在动作库里，
+# 这会表现为"做弯腰被判成屈膝下蹲"。要区分只能靠序列的时间过程（DTW）
+# 并用真实素材标定，不是加一个特征能解决的。
+ANKLE_DEPENDENT = {
+    SPACE_2D: ("left_knee_angle", "right_knee_angle", "body_height"),
+    SPACE_3D: ("l_knee_angle", "r_knee_angle", "leg_extend", "ankle_distance"),
+}
+
+
+def validate_exclude(exclude, space=SPACE_2D):
+    """校验要排除的维度名，返回规范化后的元组。
+
+    名字写错必须**报错**而不是忽略：用户排除某个维度是想要"这个动作不要用它"，
+    静默忽略会让那个维度继续参与匹配——正是本机制要消除的静默失效。
+    """
+    order = set(feature_order(space))
+    out = []
+    for name in (exclude or ()):
+        n = str(name).strip()
+        if not n:
+            continue
+        if n not in order:
+            raise ValueError(
+                f"要排除的维度 {n!r} 不在 {space} 空间的向量里。"
+                f"可选：{', '.join(feature_order(space))}")
+        if n not in out:
+            out.append(n)
+    return tuple(out)
 
 
 def missing_keys(features, space=SPACE_2D):
@@ -207,13 +252,20 @@ class TemplateMatcher:
     否则短窗口会把整段动作压平，产生尺度错配导致永远匹配不上）。
     """
 
-    def __init__(self, template_vectors, threshold=None, min_ratio=0.6, space=SPACE_2D):
+    def __init__(self, template_vectors, threshold=None, min_ratio=0.6, space=SPACE_2D,
+                 exclude=()):
         """
         template_vectors: (T, D) 模板序列
         threshold:        归一化 DTW 距离阈值（None 时按特征空间取默认值）
         min_ratio:        滑窗至少覆盖模板长度比例才判定
         space:            特征空间（2d / 3d）。维度不符直接拒绝，
                           避免用错版本的模板产生误报。
+        exclude:          该模板**不使用**的维度名（录制侧声明、存在模板数据里）。
+                          这些维度在这里被置零：均值/标准差都按 0 算，
+                          于是"零方差"→ 不会成为判别维度（见 obs_guard），
+                          观测门控也就不会因为它们去要求某个部位必须在画面里。
+                          运行时必须用同一个 `exclude` 构造向量，否则
+                          （真实值 − 0）/ 1.0 会凭空产生距离，把命中变成未命中。
         """
         raw = np.asarray(template_vectors, dtype=np.float32)
         if raw.ndim != 2 or raw.shape[0] == 0:
@@ -223,6 +275,11 @@ class TemplateMatcher:
             raise ValueError(
                 f"特征空间版本不符：space={space} 需要 {expect} 维，"
                 f"实际模板为 {raw.shape[1]} 维。请用对应版本重新录制模板。")
+        self.exclude = validate_exclude(exclude, space)
+        if self.exclude:
+            raw = raw.copy()
+            for name in self.exclude:
+                raw[:, feature_order(space).index(name)] = 0.0
         if threshold is None:
             threshold = DEFAULT_THRESHOLD.get(space, 8.0)
         self.space = space

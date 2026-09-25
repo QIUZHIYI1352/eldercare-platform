@@ -13,9 +13,10 @@ import numpy as np
 import pytest
 
 from backend.vision import obs_guard
-from backend.vision.template_matcher import (TemplateMatcher, features_to_vector,
-                                            missing_keys, normalized_distance,
-                                            feature_order, SPACE_2D, SPACE_3D)
+from backend.vision.template_matcher import (ANKLE_DEPENDENT, TemplateMatcher,
+                                            features_to_vector, missing_keys,
+                                            normalized_distance, feature_order,
+                                            validate_exclude, SPACE_2D, SPACE_3D)
 
 
 # --------------------------------------------------------------------------
@@ -48,6 +49,29 @@ def knee_template(space=SPACE_3D, t=20):
     arr[:, :] = 5.0                      # 所有维度取一个非零的恒定值
     arr[:, order.index(knee)] = np.linspace(175.0, 100.0, t)
     return arr, knee
+
+
+def squat_template(space=SPACE_3D, t=20):
+    """一个**真实**的下蹲模板：膝角与「大腿相对躯干」同时变化。
+
+    对应"拍到了脚、按普通方式录"的情形。排除踝相关维度之后，
+    膝角（需要踝）被剔除，剩下的 `trunk_vs_leg_angle`（只需肩/髋/膝）继续承担判据
+    —— 这就是"用间接特征替代"的确切含义。
+    """
+    order = feature_order(space)
+    arr = np.zeros((t, len(order)), dtype=np.float32)
+    arr[:, :] = 5.0
+    if space == SPACE_3D:
+        arr[:, order.index("l_knee_angle")] = np.linspace(180.0, 95.0, t)
+        arr[:, order.index("r_knee_angle")] = np.linspace(180.0, 95.0, t)
+        arr[:, order.index("leg_extend")] = np.linspace(2.39, 1.90, t)
+        arr[:, order.index("trunk_vs_leg_angle")] = np.linspace(180.0, 150.9, t)
+    else:
+        arr[:, order.index("left_knee_angle")] = np.linspace(180.0, 95.0, t)
+        arr[:, order.index("right_knee_angle")] = np.linspace(180.0, 95.0, t)
+        arr[:, order.index("body_height")] = np.linspace(2.39, 1.90, t)
+        arr[:, order.index("trunk_inclination")] = np.linspace(0.0, 40.0, t)
+    return arr
 
 
 # --------------------------------------------------------------------------
@@ -297,3 +321,111 @@ def test_build_gates_covers_every_matcher():
     assert gates["a1"].name == "屈膝下蹲"
     assert obs_guard.build_gates({}) == {}
     assert obs_guard.build_gates(None) == {}
+
+
+# --------------------------------------------------------------------------
+# 「间接特征」：模板声明自己不用哪些维度（脚可以不在画面里）
+#
+# 几何仿真实测：人在画面里只有腰以上时，站立/下蹲/坐下/转身的三维特征
+# **完全相同** —— 该视角下关于下蹲的信息量为零。但只要**拍到大腿（膝可见）**，
+# trunk_vs_leg_angle（大腿相对躯干，不需要踝）对下蹲的响应就有 29°，
+# 且跨机位漂移 0.000°。所以"不依赖脚"的做法是：模板排除踝相关维度。
+# --------------------------------------------------------------------------
+def test_validate_exclude_rejects_typo():
+    """排除清单里的名字写错必须报错。
+
+    静默忽略会让那个维度继续参与匹配——正是本机制要消除的静默失效。
+    """
+    with pytest.raises(ValueError, match="不在"):
+        validate_exclude(["l_kne_angle"], SPACE_3D)      # 拼错
+    with pytest.raises(ValueError):
+        validate_exclude(["trunk_inclination"], SPACE_3D)  # 那是二维的名字
+
+
+def test_validate_exclude_normalizes():
+    assert validate_exclude([], SPACE_3D) == ()
+    assert validate_exclude(None, SPACE_3D) == ()
+    assert validate_exclude(["ankle_distance", "ankle_distance"], SPACE_3D) == ("ankle_distance",)
+    assert validate_exclude([" ankle_distance "], SPACE_3D) == ("ankle_distance",)
+    assert validate_exclude(["", "  "], SPACE_3D) == ()
+
+
+def test_excluded_dimensions_are_zeroed_in_the_vector():
+    feats = {k: 3.0 for k in feature_order(SPACE_3D)}
+    vec = features_to_vector(feats, SPACE_3D, exclude=["ankle_distance", "leg_extend"])
+    order = feature_order(SPACE_3D)
+    assert vec[order.index("ankle_distance")] == 0.0
+    assert vec[order.index("leg_extend")] == 0.0
+    assert vec[order.index("trunk_vs_leg_angle")] == pytest.approx(3.0)
+
+
+def test_excluded_dims_have_zero_std_so_they_are_not_discriminative():
+    arr, knee = knee_template()
+    order = feature_order(SPACE_3D)
+    arr[:, order.index("leg_extend")] = 99.0      # 即使模板里有极值
+    m = TemplateMatcher(arr, threshold=1e9, space=SPACE_3D,
+                        exclude=["leg_extend"])
+    assert m._std_raw[order.index("leg_extend")] == 0.0
+    assert "leg_extend" not in obs_guard.discriminative_names(m._std_raw, SPACE_3D)
+
+
+def test_no_ankle_template_does_not_require_the_feet():
+    """**核心断言**：排除了踝相关维度后，脚不在画面里也能判定。
+
+    这正是"用间接特征替代"要买到的能力——同一帧，不排除时被拦、排除后放行。
+    """
+    arr = squat_template()
+    hidden_feet = hidden("left_ankle", "right_ankle")
+
+    strict = TemplateMatcher(arr, threshold=1e9, space=SPACE_3D)
+    gate_strict = obs_guard.ObsGate.from_matcher(strict, "屈膝下蹲")
+    obs_ok, low = gate_strict.check(hidden_feet)
+    assert obs_ok is False, "前置条件：这一帧本该被判为看不全"
+    assert "左脚" in low or "右脚" in low
+
+    relaxed = TemplateMatcher(arr, threshold=1e9, space=SPACE_3D,
+                              exclude=ANKLE_DEPENDENT[SPACE_3D])
+    gate_relaxed = obs_guard.ObsGate.from_matcher(relaxed, "屈膝下蹲")
+    assert gate_relaxed.required, "排除踝之后仍应要求大腿入画"
+    assert "left_ankle" not in gate_relaxed.required
+    assert "right_ankle" not in gate_relaxed.required
+    assert gate_relaxed.check(hidden_feet)[0] is True, "排除踝相关维度后不该再要求脚"
+
+
+def test_no_ankle_template_still_uses_the_thigh_signal():
+    """排除踝 ≠ 什么都不看：大腿相对躯干的信号必须还在判别集里。
+
+    否则这个模板会退化成"无判别维度"，门控不拦但也不可能有意义。
+    """
+    arr = squat_template()
+    m = TemplateMatcher(arr, threshold=1e9, space=SPACE_3D,
+                        exclude=ANKLE_DEPENDENT[SPACE_3D])
+    discs = obs_guard.discriminative_names(m._std_raw, SPACE_3D)
+    assert "trunk_vs_leg_angle" in discs, "大腿相对躯干必须留作判据"
+    for gone in ANKLE_DEPENDENT[SPACE_3D]:
+        assert gone not in discs
+    gate = obs_guard.ObsGate.from_matcher(m, "屈膝下蹲")
+    assert "left_knee" in gate.required
+    assert "left_hip" in gate.required
+
+
+def test_ankle_dependent_list_matches_the_dependency_map():
+    """元测试：把"哪些维度依赖踝"与依赖关系表钉在一起。
+
+    以后有人加了一个用踝的特征却忘了登记进 ANKLE_DEPENDENT，
+    `--no-ankle` 就会漏掉它、脚不在画面时那维度仍是编造值 —— 静默失效。
+    """
+    for space in (SPACE_2D, SPACE_3D):
+        declared = set(ANKLE_DEPENDENT[space])
+        actual = {name for name in feature_order(space)
+                  if any("ankle" in d for d in obs_guard.LANDMARK_DEPS.get(name, ()))}
+        assert actual == declared, (
+            f"{space} 空间依赖踝的维度应恰好是 {sorted(actual)}，"
+            f"但 ANKLE_DEPENDENT 声明为 {sorted(declared)}")
+
+
+def test_ankle_dependent_names_all_exist_in_their_space():
+    for space, names in ANKLE_DEPENDENT.items():
+        order = set(feature_order(space))
+        for n in names:
+            assert n in order, f"{space} 空间没有 {n} 这个维度"

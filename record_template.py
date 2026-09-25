@@ -26,8 +26,10 @@ import numpy as np
 import config
 from backend import database as db
 from backend.vision.pose_engine import PoseEngine
-from backend.vision.template_matcher import (FEATURE_VERSION, DEFAULT_THRESHOLD,
-                                             SPACE_3D, down_sample, features_to_vector)
+from backend.vision.template_matcher import (ANKLE_DEPENDENT, FEATURE_VERSION,
+                                             DEFAULT_THRESHOLD, SPACE_3D,
+                                             down_sample, features_to_vector,
+                                             validate_exclude)
 from backend.vision.video_source import VideoSource, use_video_clock
 
 
@@ -46,11 +48,25 @@ def main():
     parser.add_argument("--category", default="通用")
     parser.add_argument("--description", default="")
     parser.add_argument("--action-id", default=None, help="更新已有动作时传入其 id")
+    parser.add_argument("--no-ankle", action="store_true",
+                        help="该动作不使用依赖踝关节的维度（脚可以不在画面里，"
+                             "但**必须拍到大腿**）")
+    parser.add_argument("--exclude", default="",
+                        help="要排除的维度名，逗号分隔（该动作不依赖它们）")
     args = parser.parse_args()
 
     space = (args.space or getattr(config, "FEATURE_SPACE", "2d")).strip().lower()
     if args.threshold is None:
         args.threshold = DEFAULT_THRESHOLD.get(space, 8.0)
+
+    # 该动作不使用的维度：录制侧声明、运行时从模板数据里读，两边必须一致
+    exclude = list(validate_exclude(
+        [d for d in args.exclude.split(",") if d.strip()], space))
+    if args.no_ankle:
+        for d in ANKLE_DEPENDENT.get(space, ()):
+            if d not in exclude:
+                exclude.append(d)
+    exclude = validate_exclude(exclude, space)
 
     cap = VideoSource(args.source)
     if not cap.open():
@@ -62,6 +78,13 @@ def main():
 
     print(f"\n录制动作: {args.name}")
     print(f"特征空间: {space}（{'机位无关，可多机位共用' if space == SPACE_3D else '机位需固定'}）")
+    if exclude:
+        print(f"不使用这些维度（脚可以不在画面里）: {', '.join(exclude)}")
+        if args.no_ankle and space == SPACE_3D:
+            print("  → 用「大腿相对躯干」判定，因此**必须拍到大腿（膝盖入画）**，"
+                  "只拍腰以上是测不到的")
+            print("  → 已知代价：该量同时被躯干前倾驱动，浅蹲与轻弯腰数值接近，"
+                  "跨动作容易混淆；需用真实素材标定阈值")
     print(f"倒计时 {args.countdown} 秒后开始，请在镜头前完整演示该动作（约 {args.duration} 秒）")
 
     vectors = []
@@ -113,10 +136,10 @@ def main():
                     if pts3d:
                         saw_world = True
                         features = PoseEngine.compute_features_3d(pts3d)
-                        vectors.append(features_to_vector(features, space))
+                        vectors.append(features_to_vector(features, space, exclude))
                 else:
                     features = PoseEngine.compute_features(pts)
-                    vectors.append(features_to_vector(features, space))
+                    vectors.append(features_to_vector(features, space, exclude))
             cv2.putText(display, f"录制中... {elapsed:.1f}s / 已采集 {len(vectors)} 帧",
                         (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             if elapsed >= args.duration:
@@ -138,7 +161,8 @@ def main():
         print("已取消录制")
         return
     if state != "done" or len(vectors) < 2:
-        print(f"录制的有效骨骼帧不足（{len(vectors)} 帧），请确保全身入镜并完整演示动作")
+        need = ("确保**大腿（膝盖）入画**" if exclude else "确保全身入镜")
+        print(f"录制的有效骨骼帧不足（{len(vectors)} 帧），请{need}并完整演示动作")
         return
 
     if space == SPACE_3D and not saw_world:
@@ -166,6 +190,10 @@ def main():
         "frame_size": list(frame_wh) if frame_wh else None,
         "frame_aspect": (round(frame_wh[0] / frame_wh[1], 3)
                          if frame_wh and frame_wh[1] else None),
+        # 本模板**不使用**的维度（该动作不依赖它们，例如 --no-ankle 排除踝相关量）。
+        # 运行时必须读它并做同样处理，否则那些维度上「真实值 − 模板均值 0」会
+        # 凭空产生距离，把命中变成未命中。空列表也要写，便于区分"没声明"与"无"。
+        "excluded_dims": list(exclude),
     }
 
     if args.action_id:

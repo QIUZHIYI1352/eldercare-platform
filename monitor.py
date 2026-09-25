@@ -116,7 +116,12 @@ def build_matchers(actions, space):
                 continue
             try:
                 th = float(td.get("threshold") or 0) or None
-                seq_matchers[a["id"]] = TemplateMatcher(vectors, threshold=th, space=space)
+                # excluded_dims：模板声明"这个动作不使用哪些维度"（脚不在画面里时
+                # 排除踝相关量）。必须在这里生效，否则那些维度会成为判别维度，
+                # 观测门控反而会要求脚必须在画面里。
+                seq_matchers[a["id"]] = TemplateMatcher(
+                    vectors, threshold=th, space=space,
+                    exclude=td.get("excluded_dims") or ())
             except ValueError as e:
                 skipped.append((a.get("name") or a.get("id"), str(e)))
         else:
@@ -263,7 +268,6 @@ def main():
                         print(f"  [特征缺失] 当前空间缺少 {len(miss)} 个字段"
                               f"（{', '.join(miss[:6])}），序列匹配被跳过")
                 else:
-                    vec = features_to_vector(features, space)
                     for aid, matcher in seq_matchers.items():
                         # 观测门控：该动作真正依赖的部位没拍全时不参与匹配。
                         # mediapipe 对画面外的关节只打低 visibility 并**推测**一个
@@ -277,6 +281,8 @@ def main():
                                     print(f"  [观测门控] 看不清 {'、'.join(low)}，"
                                           f"「{action_map[aid]['name']}」暂不参与判定")
                                 continue
+                        # 向量按模板自己的排除清单构造（与录制时一致）
+                        vec = features_to_vector(features, space, matcher.exclude)
                         dist, hit = matcher.update(vec)
                         seq_status[aid] = dist
                         if hit:

@@ -378,3 +378,175 @@ def test_image_template_stays_usable_under_image_runtime():
           "version": FEATURE_VERSION[SPACE_2D], "engine_mode": "image"}
     ok, why = template_compatible(td, SPACE_2D, "image")
     assert ok, f"同为 IMAGE 模式时不应拒绝：{why}"
+
+
+# --------------------------------------------------------------------------
+# 「不依赖脚」的下蹲判据：只能靠「拍到大腿」
+#
+# 实测（本文件末尾的两个测试）：
+#   - trunk_vs_leg_angle（大腿相对躯干）不需要踝，对下蹲响应 29°，跨机位漂移 0
+#   - 但只有腰以上入画时（膝、踝都不可见），下蹲/坐下/转身与站立**完全不可区分**
+#     —— 该视角下关于下蹲的信息量为零，不是算法缺陷
+#
+# 所以"用间接特征替代膝角"的前提是**拍到大腿**；同时 trunk_vs_leg_angle 与
+# "躯干前倾"共线，浅蹲与轻弯腰会撞车，跨动作区分必须靠序列时间过程 + 真实素材标定。
+# --------------------------------------------------------------------------
+GROUND_Y = -0.86
+_L_THIGH, _L_SHIN = 0.44, 0.42
+
+
+def _legs(sk, hip_y):
+    """按腿长不变的约束解出膝/踝（脚固定在地面，膝向前）。"""
+    for side in ("left", "right"):
+        hx = sk[side + "_hip"][0]
+        hip = np.array([hx, hip_y, 0.0])
+        ank = np.array([hx, GROUND_Y, 0.0])
+        h = hip[1] - ank[1]
+        cos_t = (_L_THIGH ** 2 + h ** 2 - _L_SHIN ** 2) / (2 * _L_THIGH * h)
+        a = math.acos(max(-1.0, min(1.0, cos_t)))
+        sk[side + "_knee"] = np.array(
+            [hx, hip[1] - _L_THIGH * math.cos(a), _L_THIGH * math.sin(a)])
+        sk[side + "_ankle"] = ank
+    return sk
+
+
+def _stand():
+    return {k: np.array(v, dtype=float) for k, v in SKELETON.items()}
+
+
+def _squat(depth):
+    """下蹲：**上半身整体刚性下沉**（含肘、腕），脚固定在地面，膝向前。
+
+    注意不能只下移 y>0 的关节：手腕在 y=-0.02 会被留在原地，于是肘角被拉直
+    140°+ —— 那是个**造数器伪信号**（曾把 l_elbow_angle 从 172° 变成 26°）。
+    躯干是刚体，上半身所有关节必须一起动。见本文件末尾的自检测试。
+    """
+    sk = {k: np.array(v, dtype=float) for k, v in SKELETON.items()}
+    fixed = ("left_knee", "right_knee", "left_ankle", "right_ankle")
+    for k in sk:
+        if k not in fixed:
+            sk[k][1] -= depth
+    return _legs(sk, -depth)
+
+
+def _sit():
+    sk = {k: np.array(v, dtype=float) for k, v in SKELETON.items()}
+    for k in sk:
+        if sk[k][1] > -0.45:
+            sk[k][1] -= 0.44
+            sk[k][2] -= 0.30
+    for side in ("left", "right"):
+        hx = sk[side + "_hip"][0]
+        sk[side + "_knee"] = np.array([hx, -0.54, 0.30])
+        sk[side + "_ankle"] = np.array([hx, GROUND_Y, 0.10])
+    return sk
+
+
+def _turn():
+    a = math.radians(90.0)
+    c, s = math.cos(a), math.sin(a)
+    R = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=float)
+    return {k: R @ np.array(v, dtype=float) for k, v in SKELETON.items()}
+
+
+def _feats(coords, cam):
+    """世界坐标 -> 三维特征（调生产代码 compute_features_3d）。"""
+    cam_pts = _to_cam3d(coords, cam)
+    arr = [(0.0, 0.0, 0.0)] * 33
+    for n in LM:
+        p = cam_pts[n]
+        arr[LM[n]] = (float(p[0]), float(p[1]), float(p[2]))
+    return PoseEngine.compute_features_3d(arr)
+
+
+def _upper_only(coords):
+    """模拟「只有腰以上入画」：膝、踝落回髋附近（不可见关节的位置不可信）。
+
+    这是对 mediapipe 行为的**理想化**建模——它对画面外的关节不返回空值，
+    只打低 visibility 并给一个无信息量的推测位置。"膝在髋正下方"正是
+    "该位置不含下蹲信息"的最简模型（于是 trunk_vs_leg_angle 退化为
+    "躯干相对竖直方向"）。
+    """
+    cc = {k: np.array(v, dtype=float) for k, v in coords.items()}
+    for side in ("left", "right"):
+        cc[side + "_knee"] = cc[side + "_hip"] + np.array([0.0, -0.01, 0.0])
+        cc[side + "_ankle"] = cc[side + "_hip"] + np.array([0.0, -0.02, 0.0])
+    return cc
+
+
+def test_thigh_signal_for_squat_needs_no_ankle_and_is_camera_invariant():
+    """下蹲有响应、且**不需要踝**、且跨机位一致 —— "间接特征"的可行性依据。"""
+    f_stand = _feats(_stand(), CAMERAS["front"])
+    f_deep = _feats(_squat(0.35), CAMERAS["front"])
+    resp = f_stand["trunk_vs_leg_angle"] - f_deep["trunk_vs_leg_angle"]
+    assert resp > 20.0, f"下蹲对大腿相对躯干的响应太小（{resp:.1f}°），不足以做判据"
+
+    vals = [_feats(_squat(0.35), CAMERAS[k])["trunk_vs_leg_angle"]
+            for k in CAMERAS]
+    assert max(vals) - min(vals) < 1e-6, f"该判据竟然随机位变化：{vals}"
+
+
+def test_squat_builder_is_rigid_above_the_hips():
+    """造数器自检：下蹲时躯干是刚体，肘角/腕相对躯干的位置不该变。
+
+    这条是为一个真实踩过的坑加的——最初只下移 y>0 的关节，手腕（y=-0.02）
+    被留在原地，等于把手臂拉直，`l_elbow_angle` 从 172° 掉到 26°，
+    在"下蹲信号"的对比表里凭空造出一个 146° 的巨大响应。
+    自检先过，再谈业务结论（见 SKILL: 造数器必须先自检）。
+    """
+    a = _feats(_stand(), CAMERAS["front"])
+    b = _feats(_squat(0.35), CAMERAS["front"])
+    for k in ("l_elbow_angle", "r_elbow_angle", "l_shoulder_angle",
+              "hands_distance", "l_wrist_to_hip", "l_wrist_height"):
+        assert abs(a[k] - b[k]) < 1e-6, (
+            f"下蹲不该改变 {k}（{a[k]:.3f} -> {b[k]:.3f}）：造数器把躯干拉变形了")
+
+
+def test_waist_up_framing_carries_no_squat_information():
+    """**决定性断言**：只拍腰以上时，下蹲/坐下/转身与站立完全不可区分。
+
+    所以"用间接特征替代膝角"的前提是**拍到大腿**；
+    只拍腰以上时无论换什么算法都测不出下蹲——这是观测能力问题，不是算法问题。
+    """
+    base = _feats(_upper_only(_stand()), CAMERAS["front"])
+    for name, pose in (("下蹲", _squat(0.35)), ("坐下", _sit()), ("转身", _turn())):
+        f = _feats(_upper_only(pose), CAMERAS["front"])
+        diff = max(abs(f[k] - base[k]) for k in base)
+        # 容差 1e-4：特征里的角度由 acos 在 ~100° 量级上算出，
+        # float32 关键点转 float64 后必然带 ~1e-5 的舍入，取 1e-6 会假失败。
+        assert diff < 1e-4, (
+            f"{name} 在「只拍腰以上」的取景下竟然与站立有 {diff:.4f} 的差异 ——"
+            f"若真有响应，这段注释与 ANKLE_DEPENDENT 的前提需要重写")
+
+
+def test_thigh_signal_alone_cannot_separate_shallow_squat_from_mild_bend():
+    """记录已知边界：trunk_vs_leg_angle 与「躯干前倾」共线，浅蹲与轻弯腰会撞车。
+
+    实测（修正造数器之后）：站立 180°、浅蹲 0.15m 约 155°、躯干前倾 30° 约 150°
+    —— 两者只差几度，而动作库里同时有「弯腰操作」与「屈膝下蹲」，
+    表现就是"做弯腰被判成屈膝下蹲"。
+
+    本条**故意断言"分不开"**，作为待办：跨动作区分要靠序列的时间过程（DTW）
+    并用真实素材标定，不是加一个特征能解决的。深蹲（0.35m，约 128°）与
+    大幅弯腰（85°，约 95°）是可分的，所以混淆只发生在"浅"与"轻"这一带。
+    """
+    def tvl(coords):
+        return _feats(coords, CAMERAS["front"])["trunk_vs_leg_angle"]
+
+    stand = tvl(_stand())
+    shallow, deep = tvl(_squat(0.15)), tvl(_squat(0.35))
+
+    sk = _stand()
+    a = math.radians(30.0)
+    c, s = math.cos(a), math.sin(a)
+    for k in list(sk):
+        if sk[k][1] > 0.05:
+            sk[k] = np.array([[1, 0, 0], [0, c, -s], [0, s, c]],
+                             dtype=float) @ sk[k]
+    mild_bend = tvl(sk)
+
+    assert stand > 175.0, f"站立应接近 180°，实测 {stand:.1f}°"
+    assert deep < 135.0, f"深蹲应有明显响应，实测 {deep:.1f}°"
+    assert abs(shallow - mild_bend) < 10.0, (
+        f"浅蹲（{shallow:.1f}°）与轻弯腰（{mild_bend:.1f}°）本应撞车；"
+        f"若已分开说明有更好的判据，请更新注释与 ANKLE_DEPENDENT 的说明")

@@ -73,7 +73,12 @@ def _build_matchers(actions, space, engine_mode=DEFAULT_RUNNING_MODE):
                 continue
             try:
                 th = float(td.get("threshold") or 0) or None
-                seq[a["id"]] = TemplateMatcher(vectors, threshold=th, space=space)
+                # excluded_dims：模板声明"这个动作不使用哪些维度"（例如脚不在画面里时
+                # 排除踝相关量）。必须在这里就生效，否则那些维度会成为判别维度，
+                # 观测门控就会反过来要求脚必须在画面里 —— 正好把用户要的灵活性取消掉。
+                seq[a["id"]] = TemplateMatcher(
+                    vectors, threshold=th, space=space,
+                    exclude=td.get("excluded_dims") or ())
             except ValueError as e:
                 skipped.append((a.get("name") or a.get("id"), str(e)))
         else:
@@ -502,7 +507,6 @@ class MonitorSession:
                     if miss:
                         self._note_missing(miss)
                     else:
-                        vec = features_to_vector(features, self.space)
                         for aid, m in self.seq_matchers.items():
                             # 观测门控：该动作真正依赖的部位没拍全时，这一帧不参与
                             # 它的匹配。mediapipe 对画面外的关节只打低 visibility
@@ -513,6 +517,9 @@ class MonitorSession:
                                 if not obs_ok:
                                     self._note_obs(aid, low)
                                     continue
+                            # 向量按模板自己的排除清单构造：模板不用的维度要与
+                            # 录制时一样置零，否则会凭空产生距离（见 TemplateMatcher）。
+                            vec = features_to_vector(features, self.space, m.exclude)
                             dist, hit = m.update(vec)
                             if hit:
                                 detected_seq.append(aid)
