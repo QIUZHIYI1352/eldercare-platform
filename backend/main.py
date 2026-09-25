@@ -11,7 +11,7 @@ from backend import auth
 from backend import database as db
 from backend.routers import (auth_router, users, processes, actions,
                              devices, monitoring, training, privacy, assessment,
-                             classes, tasks, dashboard, messages)
+                             classes, tasks, dashboard, messages, phone_cam)
 
 
 @asynccontextmanager
@@ -55,6 +55,7 @@ app.include_router(tasks.router)
 app.include_router(dashboard.router)
 app.include_router(dashboard.teacher_router)
 app.include_router(messages.router)
+app.include_router(phone_cam.router)
 
 
 @app.exception_handler(auth.PermissionDenied)

@@ -581,6 +581,7 @@ const App = {
           <div class="form-row" style="margin:0"><label>自定义视频源（可选，覆盖设备）</label>
             <input id="mon-source" placeholder="rtsp://... 或 0"></div>
           <div style="display:flex;gap:8px">
+            <button class="btn" id="mon-phone" onclick="App.openPhoneCam()">用手机当摄像头</button>
             <button class="btn btn-primary" id="mon-start" onclick="App.startMonitor()">开始监控</button>
             <button class="btn btn-danger" id="mon-stop" onclick="App.stopMonitor()" disabled>停止</button>
           </div>
@@ -614,6 +615,79 @@ const App = {
       </tr>`).join("") : `<tr><td colspan="5">${this.emptyHtml("暂无监控记录")}</td></tr>`}</tbody></table></div>`;
     this.stopMonitor(true);
   },
+
+  // ---------- 用手机当摄像头 ----------
+  // 手机不装任何 App：平台在服务端起一个 HTTPS 小服务（浏览器只在安全上下文
+  // 里放行摄像头），这里把二维码显示出来，手机扫一下就进去了。
+  // 连上后视频源地址自动填好，使用者只需要点「开始监控」。
+  async openPhoneCam() {
+    let d;
+    try {
+      d = await this.api("/api/phone-cam/start", "POST", {});
+    } catch (e) { alert(e.message); return; }
+
+    // 源地址自动填好——这一步是「方便」的关键：使用者不必知道
+    // http://127.0.0.1:8444/video 这种地址的存在。
+    const src = document.getElementById("mon-source");
+    if (src) src.value = d.feed_url;
+
+    const qr = d.qr_svg
+      ? `<div style="background:#fff;padding:10px;border-radius:12px;border:1px solid var(--border);line-height:0">${d.qr_svg}</div>`
+      : `<div style="padding:14px;border:1px dashed var(--border);border-radius:12px;font-size:13px;color:var(--muted);max-width:280px">
+           本机没装 OpenCV，生成不了二维码，请手动在手机浏览器里输入右边的地址。</div>`;
+
+    this.openModal(`
+      <h3>用手机当摄像头</h3>
+      <p style="color:var(--muted);font-size:13px;margin-bottom:14px">
+        手机与你连同一个 WiFi，用相机扫码打开。页面会提示「连接不私密」——
+        自签证书的正常现象，点「高级 → 继续前往」，再点「允许」访问摄像头即可。
+        画面只在局域网内传输，不出公网。</p>
+      <div style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap">
+        ${qr}
+        <div style="flex:1;min-width:230px">
+          <div class="form-row" style="margin-top:0"><label>手机打开这个地址</label>
+            <input readonly value="${this.esc(d.https_url)}" onclick="this.select()"></div>
+          <div id="pc-state" class="tag tag-amber">等待手机扫码…</div>
+          <div style="margin-top:12px;font-size:12px;color:var(--muted)">
+            视频源已自动填好，手机连上后直接点「开始监控」。<br>
+            这台设备也会登记进「设备管理」，以后直接在设备下拉里选。</div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-danger" onclick="App.stopPhoneCam()">停止手机摄像头</button>
+        <button class="btn" onclick="App.closeModal()">关闭</button>
+      </div>`);
+    this.pollPhoneCam();
+  },
+  pollPhoneCam() {
+    if (this._pcTimer) clearInterval(this._pcTimer);
+    this._pcTimer = setInterval(async () => {
+      const el = document.getElementById("pc-state");
+      // 弹窗关了就直接停轮询（比在 closeModal 里各处挂钩子更不容易漏）
+      if (!el) { clearInterval(this._pcTimer); this._pcTimer = null; return; }
+      try {
+        const s = await this.api("/api/phone-cam/status");
+        if (s.connected) {
+          el.className = "tag tag-green";
+          el.textContent = "手机已连接" + (s.fps ? " · " + s.fps + " fps" : "")
+            + " · 已收 " + s.frames + " 帧";
+        } else if (s.running) {
+          el.className = "tag tag-amber";
+          el.textContent = "等待手机连接…";
+        } else {
+          el.className = "tag tag-red";
+          el.textContent = "服务已停止";
+        }
+      } catch (e) { /* 会话过期等，下一轮再说 */ }
+    }, 1000);
+  },
+  async stopPhoneCam() {
+    try { await this.api("/api/phone-cam/stop", "POST"); } catch (e) {}
+    if (this._pcTimer) { clearInterval(this._pcTimer); this._pcTimer = null; }
+    this.closeModal();
+    this.go("monitoring");
+  },
+
   async startMonitor() {
     const devSel = document.getElementById("mon-device");
     const source = (document.getElementById("mon-source").value.trim()

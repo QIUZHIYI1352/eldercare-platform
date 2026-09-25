@@ -18,6 +18,13 @@ def _require_manager(user):
 @router.get("")
 def list_devices(user=Depends(current_user)):
     rows = db.query("SELECT * FROM devices ORDER BY created_at DESC")
+    # 手机摄像头那一条的 status 列是静态的：手机关掉页面、锁屏或走出 WiFi
+    # 时数据库并不知道，列表上会一直挂着「在线」。这里用实时状态覆盖它。
+    from backend.vision.phone_cam import live_device_status
+    live = live_device_status()
+    for r in rows:
+        if r.get("url") in live:
+            r["status"] = live[r["url"]]
     return {"items": rows}
 
 
